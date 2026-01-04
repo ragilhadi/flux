@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_terminal_ui_creation() {
         let _ui = TerminalUI::new(30);
-        assert!(true); // Just ensure it doesn't panic
+        // Test passes if no panic occurs
     }
 
     #[test]
