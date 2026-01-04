@@ -1,0 +1,31 @@
+# Multi-step scenario with authentication
+target: "https://reqres.in"
+
+scenarios:
+  - name: "login"
+    method: "POST"
+    url: "/api/login"
+    headers:
+      Content-Type: "application/json"
+    body: |
+      {
+        "email": "eve.holt@reqres.in",
+        "password": "cityslicka"
+      }
+    extract:
+      token: "$.token"
+
+  - name: "get-users"
+    method: "GET"
+    url: "/api/users?page=2"
+    headers:
+      Authorization: "Bearer {{ token }}"
+    depends_on: "login"
+
+concurrency: 15
+duration: "20s"
+mode: "async"
+
+output:
+  json: "/app/results/scenario-auth.json"
+  html: "/app/results/scenario-auth.html"

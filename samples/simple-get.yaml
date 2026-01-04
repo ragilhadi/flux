@@ -1,0 +1,14 @@
+# Simple GET request example
+target: "https://jsonplaceholder.typicode.com/posts/1"
+method: "GET"
+
+headers:
+  Accept: "application/json"
+
+concurrency: 10
+duration: "10s"
+mode: "async"
+
+output:
+  json: "/app/results/simple-get.json"
+  html: "/app/results/simple-get.html"

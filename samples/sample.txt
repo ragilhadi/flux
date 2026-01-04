@@ -1,0 +1,5 @@
+This is a sample file for testing multipart file uploads with Flux.
+
+You can replace this with any file you want to upload during load testing.
+
+The file should be placed in the /app/data directory when running the Docker container.

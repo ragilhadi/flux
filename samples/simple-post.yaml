@@ -1,0 +1,22 @@
+# Simple POST request with JSON body
+target: "https://jsonplaceholder.typicode.com/posts"
+method: "POST"
+
+headers:
+  Content-Type: "application/json"
+  Accept: "application/json"
+
+body: |
+  {
+    "title": "Load Test Post",
+    "body": "This is a test post from Flux",
+    "userId": 1
+  }
+
+concurrency: 20
+duration: "30s"
+mode: "async"
+
+output:
+  json: "/app/results/simple-post.json"
+  html: "/app/results/simple-post.html"

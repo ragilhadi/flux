@@ -1,0 +1,24 @@
+# Multipart form-data upload example
+target: "https://httpbin.org/post"
+method: "POST"
+
+multipart:
+  - type: "field"
+    name: "username"
+    value: "testuser"
+
+  - type: "field"
+    name: "email"
+    value: "test@example.com"
+
+  - type: "file"
+    name: "document"
+    path: "/app/data/sample.txt"
+
+concurrency: 5
+duration: "15s"
+mode: "async"
+
+output:
+  json: "/app/results/multipart-upload.json"
+  html: "/app/results/multipart-upload.html"
