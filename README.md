@@ -1,5 +1,9 @@
 # ⚡ Flux – High-Performance Container-Native Load Testing
 
+[![Tests](https://github.com/ragilhadi/flux/workflows/Unit%20Tests/badge.svg)](https://github.com/ragilhadi/flux/actions)
+[![Docker](https://img.shields.io/docker/v/ragilhadi/flux?label=docker)](https://hub.docker.com/r/ragilhadi/flux)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 Flux is a fast, Docker-only load testing tool written in Rust.
 
 No installation.  

@@ -5,3 +5,5 @@ target/
 Dockerfile
 .dockerignore
 samples/
+data/
+results/
