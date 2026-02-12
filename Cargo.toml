@@ -23,7 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Terminal UI
-indicatif = "0.17"
+indicatif = "0.18"
 console = "0.15"
 colored = "2.1"
 
