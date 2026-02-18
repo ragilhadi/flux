@@ -8,7 +8,7 @@ edition = "2021"
 tokio = { version = "1.35", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -23,8 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Terminal UI
-indicatif = "0.17"
-console = "0.15"
+indicatif = "0.18"
+console = "0.16"
 colored = "2.1"
 
 # Time handling
@@ -42,5 +42,5 @@ tera = "1.19"
 
 # Signal handling
 signal-hook = "0.4"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 futures = "0.3"
