@@ -4,7 +4,7 @@ use crate::metrics::{MetricsCollector, RequestResult};
 use anyhow::Result;
 use chrono::Utc;
 use jsonpath_rust::JsonPathFinder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
@@ -70,16 +70,20 @@ impl Executor {
 
     /// Run in sync mode
     async fn run_sync(&self, start: Instant, duration: Duration) -> Result<()> {
+        let mut handles = vec![];
+
         for worker_id in 0..self.config.concurrency {
             let executor = self.clone_for_worker();
             let start_clone = start;
             let duration_clone = duration;
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 executor
                     .worker_loop(worker_id, start_clone, duration_clone)
                     .await;
             });
+
+            handles.push(handle);
 
             // Small delay between workers in sync mode
             sleep(Duration::from_millis(10)).await;
@@ -87,6 +91,11 @@ impl Executor {
 
         // Wait for duration
         sleep(duration).await;
+
+        // Wait for all workers to complete
+        for handle in handles {
+            let _ = handle.await;
+        }
 
         Ok(())
     }
@@ -131,14 +140,22 @@ impl Executor {
         let end_time = Utc::now();
 
         let request_result = match result {
-            Ok(response) => RequestResult {
-                scenario_name: None,
-                latency_ms: latency,
-                status_code: response.status().as_u16(),
-                error: None,
-                request_start_timestamp: start_time,
-                request_end_timestamp: end_time,
-            },
+            Ok(response) => {
+                let status = response.status();
+                let error = if !status.is_success() {
+                    Some(format!("HTTP {}", status.as_u16()))
+                } else {
+                    None
+                };
+                RequestResult {
+                    scenario_name: None,
+                    latency_ms: latency,
+                    status_code: status.as_u16(),
+                    error,
+                    request_start_timestamp: start_time,
+                    request_end_timestamp: end_time,
+                }
+            }
             Err(e) => {
                 error!("Request failed: {}", e);
                 RequestResult {
@@ -158,11 +175,12 @@ impl Executor {
     /// Execute all scenarios in sequence
     async fn execute_scenarios(&self) {
         let mut variables: HashMap<String, String> = HashMap::new();
+        let mut executed: HashSet<String> = HashSet::new();
 
         for scenario in &self.config.scenarios {
             // Check dependencies
             if let Some(ref depends_on) = scenario.depends_on {
-                if !self.has_executed_scenario(depends_on, &variables) {
+                if !Self::has_executed_scenario(depends_on, &executed) {
                     warn!(
                         "Skipping scenario '{}' - dependency '{}' not met",
                         scenario.name, depends_on
@@ -184,20 +202,32 @@ impl Executor {
 
             match result {
                 Ok(response) => {
-                    let status = response.status().as_u16();
+                    let status = response.status();
+                    let status_code = status.as_u16();
 
-                    // Extract variables if needed
-                    if !scenario.extract.is_empty() {
+                    let error = if !status.is_success() {
+                        Some(format!("HTTP {}", status_code))
+                    } else {
+                        None
+                    };
+
+                    // Extract variables if needed (only on success)
+                    if error.is_none() && !scenario.extract.is_empty() {
                         if let Ok(body) = response.text().await {
                             self.extract_variables(&body, scenario, &mut variables);
                         }
                     }
 
+                    // Only mark as executed on a successful response
+                    if error.is_none() {
+                        executed.insert(scenario.name.clone());
+                    }
+
                     let request_result = RequestResult {
                         scenario_name: Some(scenario.name.clone()),
                         latency_ms: latency,
-                        status_code: status,
-                        error: None,
+                        status_code,
+                        error,
                         request_start_timestamp: start_time,
                         request_end_timestamp: end_time,
                     };
@@ -271,15 +301,12 @@ impl Executor {
         }
     }
 
-    /// Check if a scenario has been executed (simple check via variables)
+    /// Check if a scenario has been executed
     fn has_executed_scenario(
-        &self,
-        _scenario_name: &str,
-        variables: &HashMap<String, String>,
+        scenario_name: &str,
+        executed: &HashSet<String>,
     ) -> bool {
-        // Simple heuristic: if we have variables, assume dependencies are met
-        // In a more sophisticated implementation, we'd track executed scenarios
-        !variables.is_empty()
+        executed.contains(scenario_name)
     }
 
     /// Clone executor for worker
@@ -319,5 +346,20 @@ mod tests {
         let executor = Executor::new(config, metrics);
 
         assert!(executor.is_ok());
+    }
+
+    #[test]
+    fn test_has_executed_scenario() {
+        let mut executed = HashSet::new();
+
+        // Not yet executed
+        assert!(!Executor::has_executed_scenario("login", &executed));
+
+        // After inserting
+        executed.insert("login".to_string());
+        assert!(Executor::has_executed_scenario("login", &executed));
+
+        // Different name still not executed
+        assert!(!Executor::has_executed_scenario("get-profile", &executed));
     }
 }
