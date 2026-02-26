@@ -57,13 +57,14 @@ impl HttpClient {
         scenario: &Scenario,
         variables: &HashMap<String, String>,
     ) -> Result<Response> {
-        // Build full URL
-        let url = if scenario.url.starts_with("http://") || scenario.url.starts_with("https://") {
-            scenario.url.clone()
+        // Build full URL with variable substitution
+        let raw_url = self.substitute_variables(&scenario.url, variables);
+        let url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+            raw_url
         } else if let Some(base) = base_url {
-            format!("{}{}", base.trim_end_matches('/'), scenario.url)
+            format!("{}{}", base.trim_end_matches('/'), raw_url)
         } else {
-            scenario.url.clone()
+            raw_url
         };
 
         let method = Method::from_str(&scenario.method)?;
@@ -177,5 +178,17 @@ mod tests {
         let result = client.substitute_variables(template, &vars);
 
         assert_eq!(result, "No variables here");
+    }
+
+    #[test]
+    fn test_substitute_variables_in_url() {
+        let client = HttpClient::new().unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("user_id".to_string(), "42".to_string());
+
+        let template = "/users/{{ user_id }}/profile";
+        let result = client.substitute_variables(template, &vars);
+
+        assert_eq!(result, "/users/42/profile");
     }
 }

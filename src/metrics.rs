@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 /// Single request result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ impl MetricsCollector {
         Self {
             results: Arc::new(Mutex::new(Vec::new())),
             histogram: Arc::new(Mutex::new(
-                Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
+                Histogram::<u64>::new_with_bounds(1, 300_000, 3).unwrap(),
             )),
             start_time: Utc::now(),
         }
@@ -74,7 +75,16 @@ impl MetricsCollector {
 
         // Update histogram
         if let Ok(mut hist) = self.histogram.lock() {
-            let _ = hist.record(latency);
+            let clamped = latency.min(300_000);
+            if clamped < latency {
+                warn!(
+                    "Latency {}ms exceeds histogram maximum; clamping to {}ms",
+                    latency, clamped
+                );
+            }
+            if let Err(e) = hist.record(clamped) {
+                warn!("Histogram record error for latency {}ms: {}", clamped, e);
+            }
         }
     }
 
@@ -209,5 +219,46 @@ mod tests {
         assert_eq!(summary.total_requests, 1);
         assert_eq!(summary.successful_requests, 1);
         assert_eq!(summary.failed_requests, 0);
+    }
+
+    #[test]
+    fn test_metrics_error_status_counted_as_failure() {
+        let collector = MetricsCollector::new();
+
+        let result = RequestResult {
+            scenario_name: None,
+            latency_ms: 50,
+            status_code: 500,
+            error: Some("HTTP 500".to_string()),
+            request_start_timestamp: Utc::now(),
+            request_end_timestamp: Utc::now(),
+        };
+
+        collector.record(result);
+
+        let summary = collector.generate_summary();
+        assert_eq!(summary.failed_requests, 1);
+        assert_eq!(summary.successful_requests, 0);
+    }
+
+    #[test]
+    fn test_metrics_large_latency_clamped() {
+        let collector = MetricsCollector::new();
+
+        // Record a latency larger than the histogram max (300_000 ms)
+        let result = RequestResult {
+            scenario_name: None,
+            latency_ms: 400_000,
+            status_code: 200,
+            error: None,
+            request_start_timestamp: Utc::now(),
+            request_end_timestamp: Utc::now(),
+        };
+
+        // Should not panic; large latency is clamped
+        collector.record(result);
+
+        let summary = collector.generate_summary();
+        assert_eq!(summary.total_requests, 1);
     }
 }

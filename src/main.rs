@@ -10,7 +10,7 @@ use config::Config;
 use executor::Executor;
 use metrics::MetricsCollector;
 use reporter::Reporter;
-use signal_hook::consts::SIGTERM;
+use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,27 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info};
 use ui::TerminalUI;
+
+/// Resolve the configuration file path from CLI args, env var, or default
+fn resolve_config_path() -> PathBuf {
+    // Check for --config or -c CLI argument
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if (args[i] == "--config" || args[i] == "-c") && i + 1 < args.len() {
+            return PathBuf::from(&args[i + 1]);
+        }
+        i += 1;
+    }
+
+    // Fall back to FLUX_CONFIG environment variable
+    if let Ok(path) = std::env::var("FLUX_CONFIG") {
+        return PathBuf::from(path);
+    }
+
+    // Default path
+    PathBuf::from("/app/config.yaml")
+}
 
 /// Main entry point
 #[tokio::main]
@@ -33,7 +54,7 @@ async fn main() -> Result<()> {
     info!("Starting Flux load testing tool");
 
     // Load configuration
-    let config_path = PathBuf::from("/app/config.yaml");
+    let config_path = resolve_config_path();
     let config = match Config::from_file(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -64,7 +85,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         use futures::stream::StreamExt;
-        let mut signals = Signals::new([SIGTERM]).expect("Failed to create signal handler");
+        let mut signals = Signals::new([SIGTERM, SIGINT]).expect("Failed to create signal handler");
         if let Some(signal) = signals.next().await {
             info!("Received signal: {:?}", signal);
             shutdown_flag_clone.store(true, Ordering::SeqCst);
