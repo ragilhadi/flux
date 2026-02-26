@@ -3,7 +3,7 @@ use crate::config::{Config, Scenario};
 use crate::metrics::{MetricsCollector, RequestResult};
 use anyhow::Result;
 use chrono::Utc;
-use jsonpath_rust::JsonPathFinder;
+use jsonpath_rust::JsonPath;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -261,39 +261,23 @@ impl Executor {
     ) {
         for (var_name, json_path) in &scenario.extract {
             match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(_json) => {
-                    match JsonPathFinder::from_str(body, json_path) {
-                        Ok(finder) => {
-                            let result = finder.find();
-                            if let serde_json::Value::Array(arr) = result {
-                                if let Some(value) = arr.first() {
-                                    let extracted = match value {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Number(n) => n.to_string(),
-                                        serde_json::Value::Bool(b) => b.to_string(),
-                                        _ => value.to_string(),
-                                    };
-
-                                    debug!("Extracted variable '{}' = '{}'", var_name, extracted);
-                                    variables.insert(var_name.clone(), extracted);
-                                }
-                            } else if result != serde_json::Value::Null {
-                                // Single value result
-                                let extracted = match result {
-                                    serde_json::Value::String(s) => s,
-                                    serde_json::Value::Number(n) => n.to_string(),
-                                    serde_json::Value::Bool(b) => b.to_string(),
-                                    _ => result.to_string(),
-                                };
-                                debug!("Extracted variable '{}' = '{}'", var_name, extracted);
-                                variables.insert(var_name.clone(), extracted);
-                            }
-                        }
-                        Err(e) => {
-                            warn!("JSONPath error for '{}': {}", json_path, e);
+                Ok(json) => match json.query(json_path) {
+                    Ok(results) => {
+                        if let Some(value) = results.first() {
+                            let extracted = match value {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                _ => value.to_string(),
+                            };
+                            debug!("Extracted variable '{}' = '{}'", var_name, extracted);
+                            variables.insert(var_name.clone(), extracted);
                         }
                     }
-                }
+                    Err(e) => {
+                        warn!("JSONPath error for '{}': {}", json_path, e);
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to parse JSON response: {}", e);
                 }
