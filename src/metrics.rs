@@ -77,7 +77,10 @@ impl MetricsCollector {
         if let Ok(mut hist) = self.histogram.lock() {
             let clamped = latency.min(300_000);
             if clamped < latency {
-                warn!("Latency {}ms exceeds histogram maximum; clamping to {}ms", latency, clamped);
+                warn!(
+                    "Latency {}ms exceeds histogram maximum; clamping to {}ms",
+                    latency, clamped
+                );
             }
             if let Err(e) = hist.record(clamped) {
                 warn!("Histogram record error for latency {}ms: {}", clamped, e);

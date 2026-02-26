@@ -191,5 +191,4 @@ mod tests {
 
         assert_eq!(result, "/users/42/profile");
     }
-
 }

@@ -302,10 +302,7 @@ impl Executor {
     }
 
     /// Check if a scenario has been executed
-    fn has_executed_scenario(
-        scenario_name: &str,
-        executed: &HashSet<String>,
-    ) -> bool {
+    fn has_executed_scenario(scenario_name: &str, executed: &HashSet<String>) -> bool {
         executed.contains(scenario_name)
     }
 
