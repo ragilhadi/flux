@@ -75,6 +75,11 @@ headers:
 concurrency: 20
 duration: "30s"
 timeout: "10s"
+ramp_up: "10s"
+think_time: "250ms"
+retry_count: 2
+retry_delay: "500ms"
+retry_on_status: [502, 503, 504]
 mode: "async"
 
 output:
@@ -199,6 +204,11 @@ output:
 | `concurrency` | integer | No | 10 | Number of concurrent workers |
 | `duration` | string | No | 30s | Test duration (e.g., "30s", "5m", "1h") |
 | `timeout` | string | No | 30s | Per-request timeout (e.g., "5s", "2m") |
+| `ramp_up` | string | No | - | Spread worker startup over this duration |
+| `think_time` | string | No | - | Pause after each simple-mode request |
+| `retry_count` | integer | No | 0 | Retry attempts after the initial request |
+| `retry_delay` | string | No | 0s | Pause between retry attempts |
+| `retry_on_status` | array | No | [] | HTTP status codes eligible for retry |
 | `mode` | string | No | async | Execution mode: "async" or "sync" |
 | `output` | object | Yes | - | Output configuration |
 
@@ -225,6 +235,10 @@ output:
 | `multipart` | array | No | Multipart form data |
 | `extract` | map | No | JSONPath extraction rules |
 | `depends_on` | string | No | Name of step this depends on |
+| `think_time` | string | No | Pause after this step |
+| `retry_count` | integer | No | Override the global retry count |
+| `retry_delay` | string | No | Override the global retry delay |
+| `retry_on_status` | array | No | Override global retryable statuses |
 
 ### Variable Extraction
 
