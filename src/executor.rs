@@ -20,7 +20,7 @@ pub struct Executor {
 impl Executor {
     /// Create a new executor
     pub fn new(config: Config, metrics: Arc<MetricsCollector>) -> Result<Self> {
-        let client = HttpClient::new()?;
+        let client = HttpClient::new(config.parse_timeout()?)?;
         Ok(Self {
             config,
             client,
@@ -294,7 +294,8 @@ impl Executor {
     fn clone_for_worker(&self) -> Self {
         Self {
             config: self.config.clone(),
-            client: HttpClient::new().expect("Failed to create client"),
+            client: HttpClient::new(self.config.parse_timeout().expect("Invalid timeout"))
+                .expect("Failed to create client"),
             metrics: Arc::clone(&self.metrics),
         }
     }
@@ -316,6 +317,7 @@ mod tests {
             scenarios: vec![],
             concurrency: 10,
             duration: "30s".to_string(),
+            timeout: "30s".to_string(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),

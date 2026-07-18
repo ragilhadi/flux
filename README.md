@@ -74,6 +74,7 @@ headers:
 
 concurrency: 20
 duration: "30s"
+timeout: "10s"
 mode: "async"
 
 output:
@@ -197,6 +198,7 @@ output:
 | `scenarios` | array | No | [] | Multi-step scenarios |
 | `concurrency` | integer | No | 10 | Number of concurrent workers |
 | `duration` | string | No | 30s | Test duration (e.g., "30s", "5m", "1h") |
+| `timeout` | string | No | 30s | Per-request timeout (e.g., "5s", "2m") |
 | `mode` | string | No | async | Execution mode: "async" or "sync" |
 | `output` | object | Yes | - | Output configuration |
 
@@ -242,6 +244,27 @@ headers:
   Authorization: "Bearer {{ token }}"
 url: "/users/{{ user_id }}/profile"
 ```
+
+### Environment Variables
+
+Any string configuration value can reference an environment variable with `${VAR}`. Flux resolves these values before validating the configuration and exits with a clear error if a referenced variable is not set.
+
+```yaml
+target: "${API_BASE_URL}"
+headers:
+  Authorization: "Bearer ${API_TOKEN}"
+```
+
+### Command-Line Overrides
+
+Use `--config` (or `-c`) to select a configuration file; `FLUX_CONFIG` is supported as an environment-variable fallback. Command-line overrides take precedence over YAML values:
+
+```bash
+flux --config ./load-test.yaml --concurrency 50 --duration 60s \
+  --output-json results.json --output-html report.html
+```
+
+Run `flux --help` for the complete flag reference.
 
 ---
 

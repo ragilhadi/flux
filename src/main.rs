@@ -6,6 +6,7 @@ mod reporter;
 mod ui;
 
 use anyhow::Result;
+use clap::Parser;
 use config::Config;
 use executor::Executor;
 use metrics::MetricsCollector;
@@ -19,30 +20,41 @@ use tokio::time::{interval, Duration};
 use tracing::{error, info};
 use ui::TerminalUI;
 
-/// Resolve the configuration file path from CLI args, env var, or default
-fn resolve_config_path() -> PathBuf {
-    // Check for --config or -c CLI argument
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if (args[i] == "--config" || args[i] == "-c") && i + 1 < args.len() {
-            return PathBuf::from(&args[i + 1]);
-        }
-        i += 1;
-    }
+#[derive(Debug, Parser)]
+#[command(name = "flux", about = "A configurable HTTP load-testing tool")]
+struct Cli {
+    /// Path to the YAML configuration file
+    #[arg(short, long, env = "FLUX_CONFIG")]
+    config: Option<PathBuf>,
 
-    // Fall back to FLUX_CONFIG environment variable
-    if let Ok(path) = std::env::var("FLUX_CONFIG") {
-        return PathBuf::from(path);
-    }
+    /// Override configured worker concurrency
+    #[arg(short = 'n', long)]
+    concurrency: Option<usize>,
 
-    // Default path
-    PathBuf::from("/app/config.yaml")
+    /// Override configured test duration (for example, 30s or 5m)
+    #[arg(short, long)]
+    duration: Option<String>,
+
+    /// Override the JSON report output path
+    #[arg(long)]
+    output_json: Option<String>,
+
+    /// Override the HTML report output path
+    #[arg(long)]
+    output_html: Option<String>,
+}
+
+/// Resolve the configuration file path from CLI args, env var, or default.
+fn resolve_config_path(cli: &Cli) -> PathBuf {
+    cli.config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/app/config.yaml"))
 }
 
 /// Main entry point
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -54,14 +66,24 @@ async fn main() -> Result<()> {
     info!("Starting Flux load testing tool");
 
     // Load configuration
-    let config_path = resolve_config_path();
-    let config = match Config::from_file(&config_path) {
+    let config_path = resolve_config_path(&cli);
+    let mut config = match Config::from_file(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Failed to load configuration: {}", e);
             std::process::exit(1);
         }
     };
+
+    if let Err(e) = config.apply_overrides(
+        cli.concurrency,
+        cli.duration,
+        cli.output_json,
+        cli.output_html,
+    ) {
+        eprintln!("Invalid configuration override: {e}");
+        std::process::exit(1);
+    }
 
     // Parse duration
     let duration_secs = match config.parse_duration() {
@@ -159,4 +181,33 @@ async fn main() -> Result<()> {
 
     info!("Flux load test completed successfully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parses_all_overrides() {
+        let cli = Cli::try_parse_from([
+            "flux",
+            "--config",
+            "test.yaml",
+            "-n",
+            "25",
+            "--duration",
+            "1m",
+            "--output-json",
+            "result.json",
+            "--output-html",
+            "report.html",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.config, Some(PathBuf::from("test.yaml")));
+        assert_eq!(cli.concurrency, Some(25));
+        assert_eq!(cli.duration.as_deref(), Some("1m"));
+        assert_eq!(cli.output_json.as_deref(), Some("result.json"));
+        assert_eq!(cli.output_html.as_deref(), Some("report.html"));
+    }
 }

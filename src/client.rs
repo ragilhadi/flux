@@ -13,9 +13,9 @@ pub struct HttpClient {
 
 impl HttpClient {
     /// Create a new HTTP client
-    pub fn new() -> Result<Self> {
+    pub fn new(timeout: Duration) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .pool_max_idle_per_host(100)
             .build()?;
 
@@ -148,7 +148,7 @@ impl HttpClient {
 
 impl Default for HttpClient {
     fn default() -> Self {
-        Self::new().expect("Failed to create HTTP client")
+        Self::new(Duration::from_secs(30)).expect("Failed to create HTTP client")
     }
 }
 
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_substitute_variables() {
-        let client = HttpClient::new().unwrap();
+        let client = HttpClient::default();
         let mut vars = HashMap::new();
         vars.insert("token".to_string(), "abc123".to_string());
         vars.insert("user".to_string(), "john".to_string());
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_substitute_no_variables() {
-        let client = HttpClient::new().unwrap();
+        let client = HttpClient::default();
         let vars = HashMap::new();
 
         let template = "No variables here";
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_substitute_variables_in_url() {
-        let client = HttpClient::new().unwrap();
+        let client = HttpClient::default();
         let mut vars = HashMap::new();
         vars.insert("user_id".to_string(), "42".to_string());
 
