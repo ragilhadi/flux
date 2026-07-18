@@ -403,7 +403,11 @@ fn parse_optional_retry_delay(value: Option<&str>) -> anyhow::Result<Duration> {
 }
 
 fn validate_status_codes(statuses: &[u16], field: &str) -> anyhow::Result<()> {
-    if let Some(invalid) = statuses.iter().find(|status| !(100..=599).contains(status)) {
+    if let Some(invalid) = statuses
+        .iter()
+        .copied()
+        .find(|status| !(100..=599).contains(status))
+    {
         anyhow::bail!("Invalid HTTP status code {invalid} in {field}");
     }
     Ok(())
