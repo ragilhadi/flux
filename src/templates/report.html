@@ -309,10 +309,10 @@
         new Chart(distCtx, {
             type: 'bar',
             data: {
-                labels: [{% for bucket in latency_distribution %}'{{ bucket.0 }}'{% if not loop.last %}, {% endif %}{% endfor %}],
+                labels: [{% for bucket in latency_distribution %}'{{ bucket.label }}'{% if not loop.last %}, {% endif %}{% endfor %}],
                 datasets: [{
                     label: 'Number of Requests',
-                    data: [{% for bucket in latency_distribution %}{{ bucket.1 }}{% if not loop.last %}, {% endif %}{% endfor %}],
+                    data: [{% for bucket in latency_distribution %}{{ bucket.count }}{% if not loop.last %}, {% endif %}{% endfor %}],
                     backgroundColor: 'rgba(102, 126, 234, 0.6)',
                     borderColor: 'rgba(102, 126, 234, 1)',
                     borderWidth: 2

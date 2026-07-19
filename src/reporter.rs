@@ -12,6 +12,12 @@ pub struct Report {
     pub results: Vec<RequestResult>,
 }
 
+#[derive(Debug, Serialize)]
+struct LatencyBucket {
+    label: String,
+    count: usize,
+}
+
 /// Reporter for generating JSON and HTML reports
 pub struct Reporter {
     report: Report,
@@ -98,31 +104,49 @@ impl Reporter {
     }
 
     /// Calculate latency distribution for histogram
-    fn calculate_latency_distribution(&self) -> Vec<(String, usize)> {
-        let mut buckets: Vec<(String, usize)> = vec![
-            ("0-50ms".to_string(), 0),
-            ("50-100ms".to_string(), 0),
-            ("100-200ms".to_string(), 0),
-            ("200-500ms".to_string(), 0),
-            ("500-1000ms".to_string(), 0),
-            ("1000ms+".to_string(), 0),
+    fn calculate_latency_distribution(&self) -> Vec<LatencyBucket> {
+        let mut buckets = vec![
+            LatencyBucket {
+                label: "0-50ms".to_string(),
+                count: 0,
+            },
+            LatencyBucket {
+                label: "50-100ms".to_string(),
+                count: 0,
+            },
+            LatencyBucket {
+                label: "100-200ms".to_string(),
+                count: 0,
+            },
+            LatencyBucket {
+                label: "200-500ms".to_string(),
+                count: 0,
+            },
+            LatencyBucket {
+                label: "500-1000ms".to_string(),
+                count: 0,
+            },
+            LatencyBucket {
+                label: "1000ms+".to_string(),
+                count: 0,
+            },
         ];
 
         for result in &self.report.results {
             let latency = result.latency_ms;
 
             if latency < 50 {
-                buckets[0].1 += 1;
+                buckets[0].count += 1;
             } else if latency < 100 {
-                buckets[1].1 += 1;
+                buckets[1].count += 1;
             } else if latency < 200 {
-                buckets[2].1 += 1;
+                buckets[2].count += 1;
             } else if latency < 500 {
-                buckets[3].1 += 1;
+                buckets[3].count += 1;
             } else if latency < 1000 {
-                buckets[4].1 += 1;
+                buckets[4].count += 1;
             } else {
-                buckets[5].1 += 1;
+                buckets[5].count += 1;
             }
         }
 
@@ -196,9 +220,9 @@ mod tests {
         let reporter = Reporter::new(summary, results);
         let distribution = reporter.calculate_latency_distribution();
 
-        assert_eq!(distribution[0].1, 1); // 0-50ms
-        assert_eq!(distribution[1].1, 1); // 50-100ms
-        assert_eq!(distribution[2].1, 1); // 100-200ms
+        assert_eq!(distribution[0].count, 1); // 0-50ms
+        assert_eq!(distribution[1].count, 1); // 50-100ms
+        assert_eq!(distribution[2].count, 1); // 100-200ms
     }
 
     #[test]
