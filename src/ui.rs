@@ -45,6 +45,13 @@ impl TerminalUI {
         if let Some(think_time) = &config.think_time {
             println!("{:<20} : {}", "Think time".bright_yellow(), think_time);
         }
+        if let Some(port) = config.prometheus_port {
+            println!(
+                "{:<20} : http://0.0.0.0:{}/metrics",
+                "Prometheus".bright_yellow(),
+                port
+            );
+        }
         println!(
             "{:<20} : {}",
             "Mode".bright_yellow(),

@@ -215,6 +215,52 @@ impl MetricsCollector {
     pub fn get_results(&self) -> Vec<RequestResult> {
         self.results.lock().unwrap().clone()
     }
+
+    /// Render a current Prometheus text-format snapshot.
+    pub fn render_prometheus(&self) -> String {
+        let results = self.results.lock().unwrap();
+        let histogram = self.histogram.lock().unwrap();
+        let total = results.len();
+        let failed = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+        let successful = total - failed;
+        let elapsed = Utc::now()
+            .signed_duration_since(self.start_time)
+            .num_milliseconds() as f64
+            / 1000.0;
+        let rps = if elapsed > 0.0 {
+            total as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        format!(
+            concat!(
+                "# HELP flux_requests_total Total requests completed by outcome.\n",
+                "# TYPE flux_requests_total counter\n",
+                "flux_requests_total{{status=\"success\"}} {}\n",
+                "flux_requests_total{{status=\"failure\"}} {}\n",
+                "# HELP flux_request_duration_ms Request latency quantiles in milliseconds.\n",
+                "# TYPE flux_request_duration_ms gauge\n",
+                "flux_request_duration_ms{{quantile=\"0.5\"}} {}\n",
+                "flux_request_duration_ms{{quantile=\"0.9\"}} {}\n",
+                "flux_request_duration_ms{{quantile=\"0.95\"}} {}\n",
+                "flux_request_duration_ms{{quantile=\"0.99\"}} {}\n",
+                "# HELP flux_rps Average requests completed per second for the current run.\n",
+                "# TYPE flux_rps gauge\n",
+                "flux_rps {:.6}\n"
+            ),
+            successful,
+            failed,
+            histogram.value_at_quantile(0.50),
+            histogram.value_at_quantile(0.90),
+            histogram.value_at_quantile(0.95),
+            histogram.value_at_quantile(0.99),
+            rps
+        )
+    }
 }
 
 fn summarize_scenario(results: &[&RequestResult], duration: f64) -> ScenarioMetricsSummary {

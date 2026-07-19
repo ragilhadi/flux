@@ -67,6 +67,10 @@ pub struct Config {
     #[serde(default)]
     pub assertions: Option<AssertionsConfig>,
 
+    /// Optional port for the live Prometheus metrics endpoint
+    #[serde(default)]
+    pub prometheus_port: Option<u16>,
+
     /// Execution mode: "async" or "sync"
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -236,6 +240,9 @@ impl Config {
         self.parse_think_time()?;
         self.parse_retry_delay()?;
         validate_status_codes(&self.retry_on_status, "retry_on_status")?;
+        if self.prometheus_port == Some(0) {
+            anyhow::bail!("prometheus_port must be greater than 0");
+        }
         if let Some(assertions) = &self.assertions {
             if let Some(max_error_rate) = assertions.max_error_rate {
                 if !(0.0..=100.0).contains(&max_error_rate) {
@@ -609,6 +616,7 @@ mod tests {
             retry_delay: None,
             retry_on_status: vec![],
             assertions: None,
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
@@ -650,6 +658,7 @@ mod tests {
             retry_delay: None,
             retry_on_status: vec![],
             assertions: None,
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "out.json".to_string(),
@@ -694,6 +703,7 @@ mod tests {
             retry_delay: None,
             retry_on_status: vec![],
             assertions: None,
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "original.json".to_string(),
@@ -737,6 +747,7 @@ mod tests {
             retry_delay: Some("0s".to_string()),
             retry_on_status: vec![503],
             assertions: None,
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
@@ -787,6 +798,7 @@ mod tests {
                 max_p95_ms: Some(300),
                 max_avg_ms: Some(200.0),
             }),
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
