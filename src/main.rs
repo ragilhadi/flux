@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod executor;
 mod metrics;
+mod prometheus;
 mod reporter;
 mod ui;
 
@@ -10,6 +11,7 @@ use clap::Parser;
 use config::Config;
 use executor::Executor;
 use metrics::MetricsCollector;
+use prometheus::PrometheusServer;
 use reporter::Reporter;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
@@ -128,6 +130,23 @@ async fn main() -> Result<()> {
         }
     };
 
+    let prometheus_server = match config.prometheus_port {
+        Some(port) => match PrometheusServer::start(port, Arc::clone(&metrics)).await {
+            Ok(server) => {
+                info!(
+                    "Prometheus metrics available at http://{}/metrics",
+                    server.local_addr()
+                );
+                Some(server)
+            }
+            Err(e) => {
+                ui.display_error(&format!("Failed to start Prometheus endpoint: {e}"));
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // Start live metrics update task
     let metrics_clone = Arc::clone(&metrics);
     let ui_handle = tokio::spawn(async move {
@@ -151,7 +170,15 @@ async fn main() -> Result<()> {
 
     // Run the load test
     info!("Starting load test execution");
-    if let Err(e) = executor.run(duration_secs).await {
+    let execution_result = executor.run(duration_secs).await;
+
+    if let Some(server) = prometheus_server {
+        if let Err(e) = server.shutdown().await {
+            error!("Failed to stop Prometheus endpoint cleanly: {}", e);
+        }
+    }
+
+    if let Err(e) = execution_result {
         error!("Load test execution failed: {}", e);
         std::process::exit(1);
     }

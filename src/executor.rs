@@ -434,6 +434,7 @@ mod tests {
             retry_delay: None,
             retry_on_status: vec![],
             assertions: None,
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
@@ -513,6 +514,7 @@ mod tests {
             retry_delay: Some("0s".to_string()),
             retry_on_status: vec![503],
             assertions: None,
+            prometheus_port: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
