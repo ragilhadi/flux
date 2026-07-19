@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
@@ -41,6 +42,24 @@ pub struct MetricsSummary {
     pub error_rate: f64,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
+    pub per_scenario: BTreeMap<String, ScenarioMetricsSummary>,
+}
+
+/// Summary statistics for one named scenario step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioMetricsSummary {
+    pub total_requests: usize,
+    pub successful_requests: usize,
+    pub failed_requests: usize,
+    pub throughput_rps: f64,
+    pub min_latency_ms: u64,
+    pub max_latency_ms: u64,
+    pub mean_latency_ms: f64,
+    pub p50_latency_ms: u64,
+    pub p90_latency_ms: u64,
+    pub p95_latency_ms: u64,
+    pub p99_latency_ms: u64,
+    pub error_rate: f64,
 }
 
 /// Live metrics for terminal display
@@ -161,6 +180,17 @@ impl MetricsCollector {
         let p95 = histogram.value_at_quantile(0.95);
         let p99 = histogram.value_at_quantile(0.99);
 
+        let mut grouped: BTreeMap<String, Vec<&RequestResult>> = BTreeMap::new();
+        for result in results.iter() {
+            if let Some(name) = &result.scenario_name {
+                grouped.entry(name.clone()).or_default().push(result);
+            }
+        }
+        let per_scenario = grouped
+            .into_iter()
+            .map(|(name, results)| (name, summarize_scenario(&results, duration)))
+            .collect();
+
         MetricsSummary {
             total_requests: total,
             successful_requests: successful,
@@ -177,6 +207,7 @@ impl MetricsCollector {
             error_rate,
             start_time: self.start_time,
             end_time,
+            per_scenario,
         }
     }
 
@@ -184,6 +215,44 @@ impl MetricsCollector {
     pub fn get_results(&self) -> Vec<RequestResult> {
         self.results.lock().unwrap().clone()
     }
+}
+
+fn summarize_scenario(results: &[&RequestResult], duration: f64) -> ScenarioMetricsSummary {
+    let total = results.len();
+    let successful = results
+        .iter()
+        .filter(|result| result.error.is_none())
+        .count();
+    let failed = total - successful;
+    let mut latencies: Vec<u64> = results.iter().map(|result| result.latency_ms).collect();
+    latencies.sort_unstable();
+    let mean = latencies.iter().sum::<u64>() as f64 / total as f64;
+
+    ScenarioMetricsSummary {
+        total_requests: total,
+        successful_requests: successful,
+        failed_requests: failed,
+        throughput_rps: if duration > 0.0 {
+            total as f64 / duration
+        } else {
+            0.0
+        },
+        min_latency_ms: latencies[0],
+        max_latency_ms: latencies[total - 1],
+        mean_latency_ms: mean,
+        p50_latency_ms: percentile(&latencies, 0.50),
+        p90_latency_ms: percentile(&latencies, 0.90),
+        p95_latency_ms: percentile(&latencies, 0.95),
+        p99_latency_ms: percentile(&latencies, 0.99),
+        error_rate: (failed as f64 / total as f64) * 100.0,
+    }
+}
+
+fn percentile(sorted_values: &[u64], quantile: f64) -> u64 {
+    let index = ((sorted_values.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted_values.len() - 1);
+    sorted_values[index]
 }
 
 impl Default for MetricsCollector {
@@ -219,6 +288,10 @@ mod tests {
         assert_eq!(summary.total_requests, 1);
         assert_eq!(summary.successful_requests, 1);
         assert_eq!(summary.failed_requests, 0);
+        let scenario = summary.per_scenario.get("test").unwrap();
+        assert_eq!(scenario.total_requests, 1);
+        assert_eq!(scenario.successful_requests, 1);
+        assert_eq!(scenario.p95_latency_ms, 100);
     }
 
     #[test]
@@ -239,6 +312,7 @@ mod tests {
         let summary = collector.generate_summary();
         assert_eq!(summary.failed_requests, 1);
         assert_eq!(summary.successful_requests, 0);
+        assert!(summary.per_scenario.is_empty());
     }
 
     #[test]

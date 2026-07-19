@@ -200,6 +200,39 @@
                 </div>
             </div>
 
+            {% if summary.per_scenario | length > 0 %}
+            <!-- Per-Scenario Metrics -->
+            <div class="chart-section">
+                <h2>Per-Scenario Metrics</h2>
+                <table class="percentiles-table">
+                    <thead>
+                        <tr>
+                            <th>Scenario</th>
+                            <th>Requests</th>
+                            <th>Failed</th>
+                            <th>RPS</th>
+                            <th>Mean (ms)</th>
+                            <th>P95 (ms)</th>
+                            <th>P99 (ms)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for name, metrics in summary.per_scenario %}
+                        <tr>
+                            <td>{{ name }}</td>
+                            <td>{{ metrics.total_requests }}</td>
+                            <td class="{% if metrics.failed_requests > 0 %}error{% else %}success{% endif %}">{{ metrics.failed_requests }}</td>
+                            <td>{{ metrics.throughput_rps | round(precision=2) }}</td>
+                            <td>{{ metrics.mean_latency_ms | round(precision=2) }}</td>
+                            <td>{{ metrics.p95_latency_ms }}</td>
+                            <td>{{ metrics.p99_latency_ms }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+
             <!-- Percentiles Table -->
             <div class="chart-section">
                 <h2>📊 Latency Percentiles</h2>

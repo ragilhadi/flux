@@ -222,6 +222,7 @@ mod tests {
             error_rate: 5.0,
             start_time: Utc::now(),
             end_time: Utc::now(),
+            per_scenario: Default::default(),
         };
 
         // This will print to stdout, but we're just testing it doesn't panic

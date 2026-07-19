@@ -82,9 +82,16 @@ retry_delay: "500ms"
 retry_on_status: [502, 503, 504]
 mode: "async"
 
+assertions:
+  max_error_rate: 1.0
+  max_p95_ms: 300
+  max_p99_ms: 500
+  max_avg_ms: 200
+
 output:
   json: "/app/results/output.json"
   html: "/app/results/report.html"
+  csv: "/app/results/requests.csv"
 ```
 
 ### POST with JSON Body
@@ -158,6 +165,9 @@ scenarios:
     extract:
       token: "$.access_token"
       user_id: "$.user.id"
+    assert:
+      status_code: 200
+      body_contains: "access_token"
 
   - name: "get-profile"
     method: "GET"
@@ -209,6 +219,7 @@ output:
 | `retry_count` | integer | No | 0 | Retry attempts after the initial request |
 | `retry_delay` | string | No | 0s | Pause between retry attempts |
 | `retry_on_status` | array | No | [] | HTTP status codes eligible for retry |
+| `assertions` | object | No | - | Aggregate error-rate and latency quality gates |
 | `mode` | string | No | async | Execution mode: "async" or "sync" |
 | `output` | object | Yes | - | Output configuration |
 
@@ -239,6 +250,17 @@ output:
 | `retry_count` | integer | No | Override the global retry count |
 | `retry_delay` | string | No | Override the global retry delay |
 | `retry_on_status` | array | No | Override global retryable statuses |
+| `assert` | object | No | Expected `status_code` and/or `body_contains` value |
+
+### Quality Gates
+
+Aggregate assertions support `max_error_rate`, `max_p95_ms`, `max_p99_ms`, and `max_avg_ms`. Failed assertions are printed after reports are generated and cause Flux to exit with status code 1.
+
+Scenario response assertions are recorded as request failures when the expected status or body content does not match.
+
+### Report Outputs
+
+`output.json` and `output.html` remain required. Set optional `output.csv` to write one row per request with timestamp, scenario, latency, status code, and error details.
 
 ### Variable Extraction
 
@@ -275,7 +297,7 @@ Use `--config` (or `-c`) to select a configuration file; `FLUX_CONFIG` is suppor
 
 ```bash
 flux --config ./load-test.yaml --concurrency 50 --duration 60s \
-  --output-json results.json --output-html report.html
+  --output-json results.json --output-html report.html --output-csv requests.csv
 ```
 
 Run `flux --help` for the complete flag reference.

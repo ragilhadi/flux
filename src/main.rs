@@ -42,6 +42,10 @@ struct Cli {
     /// Override the HTML report output path
     #[arg(long)]
     output_html: Option<String>,
+
+    /// Override the CSV report output path and enable CSV output
+    #[arg(long)]
+    output_csv: Option<String>,
 }
 
 /// Resolve the configuration file path from CLI args, env var, or default.
@@ -80,6 +84,7 @@ async fn main() -> Result<()> {
         cli.duration,
         cli.output_json,
         cli.output_html,
+        cli.output_csv,
     ) {
         eprintln!("Invalid configuration override: {e}");
         std::process::exit(1);
@@ -158,6 +163,7 @@ async fn main() -> Result<()> {
     info!("Generating summary");
     let summary = metrics.generate_summary();
     let results = metrics.get_results();
+    let assertion_failures = config.evaluate_assertions(&summary);
 
     // Display summary in terminal
     let ui = TerminalUI::new(duration_secs);
@@ -177,6 +183,21 @@ async fn main() -> Result<()> {
         error!("Failed to generate HTML report: {}", e);
     } else {
         ui.display_success(&format!("HTML report saved to: {}", config.output.html));
+    }
+
+    if let Some(csv_path) = &config.output.csv {
+        if let Err(e) = reporter.generate_csv(csv_path) {
+            error!("Failed to generate CSV report: {}", e);
+        } else {
+            ui.display_success(&format!("CSV report saved to: {csv_path}"));
+        }
+    }
+
+    if !assertion_failures.is_empty() {
+        for failure in &assertion_failures {
+            ui.display_error(&format!("Assertion failed: {failure}"));
+        }
+        std::process::exit(1);
     }
 
     info!("Flux load test completed successfully");
@@ -201,6 +222,8 @@ mod tests {
             "result.json",
             "--output-html",
             "report.html",
+            "--output-csv",
+            "results.csv",
         ])
         .unwrap();
 
@@ -209,5 +232,6 @@ mod tests {
         assert_eq!(cli.duration.as_deref(), Some("1m"));
         assert_eq!(cli.output_json.as_deref(), Some("result.json"));
         assert_eq!(cli.output_html.as_deref(), Some("report.html"));
+        assert_eq!(cli.output_csv.as_deref(), Some("results.csv"));
     }
 }
