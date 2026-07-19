@@ -39,6 +39,12 @@ impl TerminalUI {
             config.concurrency
         );
         println!("{:<20} : {}s", "Duration".bright_yellow(), duration_secs);
+        if let Some(ramp_up) = &config.ramp_up {
+            println!("{:<20} : {}", "Ramp-up".bright_yellow(), ramp_up);
+        }
+        if let Some(think_time) = &config.think_time {
+            println!("{:<20} : {}", "Think time".bright_yellow(), think_time);
+        }
         println!(
             "{:<20} : {}",
             "Mode".bright_yellow(),

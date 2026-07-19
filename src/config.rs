@@ -42,6 +42,26 @@ pub struct Config {
     #[serde(default = "default_timeout")]
     pub timeout: String,
 
+    /// Optional duration over which workers are started gradually
+    #[serde(default)]
+    pub ramp_up: Option<String>,
+
+    /// Optional pause between requests in simple mode
+    #[serde(default)]
+    pub think_time: Option<String>,
+
+    /// Number of retry attempts after the initial request
+    #[serde(default)]
+    pub retry_count: u32,
+
+    /// Delay between retry attempts
+    #[serde(default)]
+    pub retry_delay: Option<String>,
+
+    /// HTTP status codes that should be retried
+    #[serde(default)]
+    pub retry_on_status: Vec<u16>,
+
     /// Execution mode: "async" or "sync"
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -100,6 +120,22 @@ pub struct Scenario {
     /// Dependency on previous step
     #[serde(default)]
     pub depends_on: Option<String>,
+
+    /// Optional pause after this scenario step
+    #[serde(default)]
+    pub think_time: Option<String>,
+
+    /// Scenario-specific retry count override
+    #[serde(default)]
+    pub retry_count: Option<u32>,
+
+    /// Scenario-specific retry delay override
+    #[serde(default)]
+    pub retry_delay: Option<String>,
+
+    /// Scenario-specific retryable status-code override
+    #[serde(default)]
+    pub retry_on_status: Option<Vec<u16>>,
 }
 
 /// Output configuration
@@ -157,6 +193,14 @@ impl Config {
 
         self.parse_duration()?;
         self.parse_timeout()?;
+        if let Some(ramp_up) = self.parse_ramp_up()? {
+            if ramp_up > Duration::from_secs(self.parse_duration()?) {
+                anyhow::bail!("Ramp-up duration cannot exceed the test duration");
+            }
+        }
+        self.parse_think_time()?;
+        self.parse_retry_delay()?;
+        validate_status_codes(&self.retry_on_status, "retry_on_status")?;
 
         // Validate multipart parts
         if let Some(ref parts) = self.multipart {
@@ -172,6 +216,15 @@ impl Config {
 
         // Validate scenarios
         for scenario in &self.scenarios {
+            parse_optional_duration(scenario.think_time.as_deref())?;
+            parse_optional_retry_delay(scenario.retry_delay.as_deref())?;
+            if let Some(statuses) = &scenario.retry_on_status {
+                validate_status_codes(
+                    statuses,
+                    &format!("retry_on_status in scenario '{}'", scenario.name),
+                )?;
+            }
+
             if let Some(ref parts) = scenario.multipart {
                 for part in parts {
                     if part.part_type == "file" && part.path.is_none() {
@@ -207,6 +260,47 @@ impl Config {
         parse_duration(&self.timeout)
     }
 
+    /// Parse the optional worker ramp-up duration.
+    pub fn parse_ramp_up(&self) -> anyhow::Result<Option<Duration>> {
+        parse_optional_duration(self.ramp_up.as_deref())
+    }
+
+    /// Parse the optional simple-mode think time.
+    pub fn parse_think_time(&self) -> anyhow::Result<Option<Duration>> {
+        parse_optional_duration(self.think_time.as_deref())
+    }
+
+    /// Parse the think time configured for a scenario step.
+    pub fn parse_think_time_for(&self, scenario: &Scenario) -> anyhow::Result<Option<Duration>> {
+        parse_optional_duration(scenario.think_time.as_deref())
+    }
+
+    /// Parse the top-level retry delay, defaulting to no delay.
+    pub fn parse_retry_delay(&self) -> anyhow::Result<Duration> {
+        parse_optional_retry_delay(self.retry_delay.as_deref())
+    }
+
+    /// Resolve a scenario's retry count against the top-level default.
+    pub fn retry_count_for(&self, scenario: &Scenario) -> u32 {
+        scenario.retry_count.unwrap_or(self.retry_count)
+    }
+
+    /// Resolve a scenario's retry delay against the top-level default.
+    pub fn retry_delay_for(&self, scenario: &Scenario) -> anyhow::Result<Duration> {
+        match scenario.retry_delay.as_deref() {
+            Some(value) => parse_duration_allow_zero(value),
+            None => self.parse_retry_delay(),
+        }
+    }
+
+    /// Resolve a scenario's retryable statuses against the top-level default.
+    pub fn retry_statuses_for<'a>(&'a self, scenario: &'a Scenario) -> &'a [u16] {
+        scenario
+            .retry_on_status
+            .as_deref()
+            .unwrap_or(&self.retry_on_status)
+    }
+
     /// Apply runtime values that override the YAML configuration.
     pub fn apply_overrides(
         &mut self,
@@ -238,6 +332,9 @@ impl Config {
         self.multipart = expand_multipart(self.multipart.take())?;
         self.duration = expand_environment_value(&self.duration)?;
         self.timeout = expand_environment_value(&self.timeout)?;
+        self.ramp_up = expand_optional(self.ramp_up.take())?;
+        self.think_time = expand_optional(self.think_time.take())?;
+        self.retry_delay = expand_optional(self.retry_delay.take())?;
         self.mode = expand_environment_value(&self.mode)?;
         self.output.json = expand_environment_value(&self.output.json)?;
         self.output.html = expand_environment_value(&self.output.html)?;
@@ -251,6 +348,8 @@ impl Config {
             scenario.multipart = expand_multipart(scenario.multipart.take())?;
             scenario.extract = expand_map(std::mem::take(&mut scenario.extract))?;
             scenario.depends_on = expand_optional(scenario.depends_on.take())?;
+            scenario.think_time = expand_optional(scenario.think_time.take())?;
+            scenario.retry_delay = expand_optional(scenario.retry_delay.take())?;
         }
 
         Ok(())
@@ -263,6 +362,14 @@ impl Config {
 }
 
 fn parse_duration(value: &str) -> anyhow::Result<Duration> {
+    let duration = parse_duration_allow_zero(value)?;
+    if duration.is_zero() {
+        anyhow::bail!("Duration must be greater than zero");
+    }
+    Ok(duration)
+}
+
+fn parse_duration_allow_zero(value: &str) -> anyhow::Result<Duration> {
     let value = value.trim();
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
         (number, 1_u64)
@@ -281,11 +388,29 @@ fn parse_duration(value: &str) -> anyhow::Result<Duration> {
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow::anyhow!("Duration is too large: {value}"))?;
 
-    if milliseconds == 0 {
-        anyhow::bail!("Duration must be greater than zero");
-    }
-
     Ok(Duration::from_millis(milliseconds))
+}
+
+fn parse_optional_duration(value: Option<&str>) -> anyhow::Result<Option<Duration>> {
+    value.map(parse_duration).transpose()
+}
+
+fn parse_optional_retry_delay(value: Option<&str>) -> anyhow::Result<Duration> {
+    value
+        .map(parse_duration_allow_zero)
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn validate_status_codes(statuses: &[u16], field: &str) -> anyhow::Result<()> {
+    if let Some(invalid) = statuses
+        .iter()
+        .copied()
+        .find(|status| !(100..=599).contains(status))
+    {
+        anyhow::bail!("Invalid HTTP status code {invalid} in {field}");
+    }
+    Ok(())
 }
 
 fn expand_optional(value: Option<String>) -> anyhow::Result<Option<String>> {
@@ -372,6 +497,11 @@ mod tests {
             concurrency: 10,
             duration: "30s".to_string(),
             timeout: "30s".to_string(),
+            ramp_up: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
@@ -406,6 +536,11 @@ mod tests {
             concurrency: 1,
             duration: "1s".to_string(),
             timeout: "250ms".to_string(),
+            ramp_up: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "out.json".to_string(),
@@ -443,6 +578,11 @@ mod tests {
             concurrency: 10,
             duration: "30s".to_string(),
             timeout: "30s".to_string(),
+            ramp_up: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "original.json".to_string(),
@@ -463,5 +603,48 @@ mod tests {
         assert_eq!(config.parse_duration().unwrap(), 60);
         assert_eq!(config.output.json, "override.json");
         assert_eq!(config.output.html, "override.html");
+    }
+
+    #[test]
+    fn test_load_modeling_durations_and_retry_delay() {
+        let mut config = Config {
+            target: Some("http://example.com".to_string()),
+            method: Some("GET".to_string()),
+            headers: HashMap::new(),
+            body: None,
+            multipart: None,
+            scenarios: vec![],
+            concurrency: 10,
+            duration: "30s".to_string(),
+            timeout: "5s".to_string(),
+            ramp_up: Some("10s".to_string()),
+            think_time: Some("250ms".to_string()),
+            retry_count: 2,
+            retry_delay: Some("0s".to_string()),
+            retry_on_status: vec![503],
+            mode: "async".to_string(),
+            output: OutputConfig {
+                json: "output.json".to_string(),
+                html: "output.html".to_string(),
+            },
+        };
+
+        config.validate().unwrap();
+        assert_eq!(
+            config.parse_ramp_up().unwrap(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            config.parse_think_time().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(config.parse_retry_delay().unwrap(), Duration::ZERO);
+
+        config.ramp_up = Some("31s".to_string());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("Ramp-up"));
     }
 }
