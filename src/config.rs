@@ -1,3 +1,4 @@
+use crate::metrics::MetricsSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,6 +62,10 @@ pub struct Config {
     /// HTTP status codes that should be retried
     #[serde(default)]
     pub retry_on_status: Vec<u16>,
+
+    /// Aggregate pass/fail thresholds evaluated after the test
+    #[serde(default)]
+    pub assertions: Option<AssertionsConfig>,
 
     /// Execution mode: "async" or "sync"
     #[serde(default = "default_mode")]
@@ -136,6 +141,32 @@ pub struct Scenario {
     /// Scenario-specific retryable status-code override
     #[serde(default)]
     pub retry_on_status: Option<Vec<u16>>,
+
+    /// Response expectations for this scenario step
+    #[serde(default, rename = "assert")]
+    pub assertions: Option<ResponseAssertions>,
+}
+
+/// Aggregate test-level quality gates.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AssertionsConfig {
+    #[serde(default)]
+    pub max_error_rate: Option<f64>,
+    #[serde(default)]
+    pub max_p99_ms: Option<u64>,
+    #[serde(default)]
+    pub max_p95_ms: Option<u64>,
+    #[serde(default)]
+    pub max_avg_ms: Option<f64>,
+}
+
+/// Response assertions for a scenario step.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ResponseAssertions {
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub body_contains: Option<String>,
 }
 
 /// Output configuration
@@ -146,6 +177,10 @@ pub struct OutputConfig {
 
     /// HTML output file path
     pub html: String,
+
+    /// Optional CSV output file path
+    #[serde(default)]
+    pub csv: Option<String>,
 }
 
 fn default_concurrency() -> usize {
@@ -201,6 +236,16 @@ impl Config {
         self.parse_think_time()?;
         self.parse_retry_delay()?;
         validate_status_codes(&self.retry_on_status, "retry_on_status")?;
+        if let Some(assertions) = &self.assertions {
+            if let Some(max_error_rate) = assertions.max_error_rate {
+                if !(0.0..=100.0).contains(&max_error_rate) {
+                    anyhow::bail!("max_error_rate must be between 0 and 100");
+                }
+            }
+            if assertions.max_avg_ms.is_some_and(|value| value < 0.0) {
+                anyhow::bail!("max_avg_ms cannot be negative");
+            }
+        }
 
         // Validate multipart parts
         if let Some(ref parts) = self.multipart {
@@ -222,6 +267,16 @@ impl Config {
                 validate_status_codes(
                     statuses,
                     &format!("retry_on_status in scenario '{}'", scenario.name),
+                )?;
+            }
+            if let Some(expected) = scenario
+                .assertions
+                .as_ref()
+                .and_then(|assertions| assertions.status_code)
+            {
+                validate_status_codes(
+                    &[expected],
+                    &format!("assert.status_code in scenario '{}'", scenario.name),
                 )?;
             }
 
@@ -308,6 +363,7 @@ impl Config {
         duration: Option<String>,
         output_json: Option<String>,
         output_html: Option<String>,
+        output_csv: Option<String>,
     ) -> anyhow::Result<()> {
         if let Some(concurrency) = concurrency {
             self.concurrency = concurrency;
@@ -321,7 +377,53 @@ impl Config {
         if let Some(output_html) = output_html {
             self.output.html = output_html;
         }
+        if let Some(output_csv) = output_csv {
+            self.output.csv = Some(output_csv);
+        }
         self.validate()
+    }
+
+    /// Evaluate configured aggregate assertions against a final summary.
+    pub fn evaluate_assertions(&self, summary: &MetricsSummary) -> Vec<String> {
+        let Some(assertions) = &self.assertions else {
+            return Vec::new();
+        };
+        let mut failures = Vec::new();
+
+        if let Some(max) = assertions.max_error_rate {
+            if summary.error_rate > max {
+                failures.push(format!(
+                    "error rate {:.2}% exceeds maximum {:.2}%",
+                    summary.error_rate, max
+                ));
+            }
+        }
+        if let Some(max) = assertions.max_p99_ms {
+            if summary.p99_latency_ms > max {
+                failures.push(format!(
+                    "p99 latency {}ms exceeds maximum {}ms",
+                    summary.p99_latency_ms, max
+                ));
+            }
+        }
+        if let Some(max) = assertions.max_p95_ms {
+            if summary.p95_latency_ms > max {
+                failures.push(format!(
+                    "p95 latency {}ms exceeds maximum {}ms",
+                    summary.p95_latency_ms, max
+                ));
+            }
+        }
+        if let Some(max) = assertions.max_avg_ms {
+            if summary.mean_latency_ms > max {
+                failures.push(format!(
+                    "mean latency {:.2}ms exceeds maximum {:.2}ms",
+                    summary.mean_latency_ms, max
+                ));
+            }
+        }
+
+        failures
     }
 
     fn expand_environment_variables(&mut self) -> anyhow::Result<()> {
@@ -338,6 +440,7 @@ impl Config {
         self.mode = expand_environment_value(&self.mode)?;
         self.output.json = expand_environment_value(&self.output.json)?;
         self.output.html = expand_environment_value(&self.output.html)?;
+        self.output.csv = expand_optional(self.output.csv.take())?;
 
         for scenario in &mut self.scenarios {
             scenario.name = expand_environment_value(&scenario.name)?;
@@ -350,6 +453,9 @@ impl Config {
             scenario.depends_on = expand_optional(scenario.depends_on.take())?;
             scenario.think_time = expand_optional(scenario.think_time.take())?;
             scenario.retry_delay = expand_optional(scenario.retry_delay.take())?;
+            if let Some(assertions) = &mut scenario.assertions {
+                assertions.body_contains = expand_optional(assertions.body_contains.take())?;
+            }
         }
 
         Ok(())
@@ -502,10 +608,12 @@ mod tests {
             retry_count: 0,
             retry_delay: None,
             retry_on_status: vec![],
+            assertions: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
                 html: "/app/results/output.html".to_string(),
+                csv: None,
             },
         };
 
@@ -541,10 +649,12 @@ mod tests {
             retry_count: 0,
             retry_delay: None,
             retry_on_status: vec![],
+            assertions: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "out.json".to_string(),
                 html: "out.html".to_string(),
+                csv: None,
             },
         };
         assert_eq!(config.parse_timeout().unwrap(), Duration::from_millis(250));
@@ -583,10 +693,12 @@ mod tests {
             retry_count: 0,
             retry_delay: None,
             retry_on_status: vec![],
+            assertions: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "original.json".to_string(),
                 html: "original.html".to_string(),
+                csv: None,
             },
         };
 
@@ -596,6 +708,7 @@ mod tests {
                 Some("1m".to_string()),
                 Some("override.json".to_string()),
                 Some("override.html".to_string()),
+                Some("override.csv".to_string()),
             )
             .unwrap();
 
@@ -603,6 +716,7 @@ mod tests {
         assert_eq!(config.parse_duration().unwrap(), 60);
         assert_eq!(config.output.json, "override.json");
         assert_eq!(config.output.html, "override.html");
+        assert_eq!(config.output.csv.as_deref(), Some("override.csv"));
     }
 
     #[test]
@@ -622,10 +736,12 @@ mod tests {
             retry_count: 2,
             retry_delay: Some("0s".to_string()),
             retry_on_status: vec![503],
+            assertions: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
+                csv: None,
             },
         };
 
@@ -646,5 +762,62 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Ramp-up"));
+    }
+
+    #[test]
+    fn test_aggregate_assertion_evaluation() {
+        let config = Config {
+            target: Some("http://example.com".to_string()),
+            method: Some("GET".to_string()),
+            headers: HashMap::new(),
+            body: None,
+            multipart: None,
+            scenarios: vec![],
+            concurrency: 1,
+            duration: "1s".to_string(),
+            timeout: "1s".to_string(),
+            ramp_up: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
+            assertions: Some(AssertionsConfig {
+                max_error_rate: Some(1.0),
+                max_p99_ms: Some(500),
+                max_p95_ms: Some(300),
+                max_avg_ms: Some(200.0),
+            }),
+            mode: "async".to_string(),
+            output: OutputConfig {
+                json: "output.json".to_string(),
+                html: "output.html".to_string(),
+                csv: None,
+            },
+        };
+        let summary = MetricsSummary {
+            total_requests: 100,
+            successful_requests: 95,
+            failed_requests: 5,
+            total_duration_secs: 1.0,
+            throughput_rps: 100.0,
+            min_latency_ms: 10,
+            max_latency_ms: 800,
+            mean_latency_ms: 250.0,
+            p50_latency_ms: 100,
+            p90_latency_ms: 200,
+            p95_latency_ms: 350,
+            p99_latency_ms: 600,
+            error_rate: 5.0,
+            start_time: chrono::Utc::now(),
+            end_time: chrono::Utc::now(),
+            per_scenario: Default::default(),
+        };
+
+        let failures = config.evaluate_assertions(&summary);
+        assert_eq!(failures.len(), 4);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("error rate")));
+        assert!(failures.iter().any(|failure| failure.contains("p99")));
     }
 }

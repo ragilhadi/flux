@@ -1,5 +1,5 @@
 use crate::client::HttpClient;
-use crate::config::{Config, Scenario};
+use crate::config::{Config, ResponseAssertions, Scenario};
 use crate::metrics::{MetricsCollector, RequestResult};
 use anyhow::Result;
 use chrono::Utc;
@@ -230,22 +230,47 @@ impl Executor {
                 Ok(response) => {
                     let status = response.status();
                     let status_code = status.as_u16();
-
-                    let error = if !status.is_success() {
-                        Some(format!("HTTP {}", status_code))
+                    let mut assertion_error = response_status_error(
+                        status_code,
+                        status.is_success(),
+                        scenario.assertions.as_ref(),
+                    );
+                    let needs_body = !scenario.extract.is_empty()
+                        || scenario
+                            .assertions
+                            .as_ref()
+                            .and_then(|assertions| assertions.body_contains.as_ref())
+                            .is_some();
+                    let body = if needs_body {
+                        match response.text().await {
+                            Ok(body) => Some(body),
+                            Err(error) => {
+                                if assertion_error.is_none() {
+                                    assertion_error = Some(format!(
+                                        "Failed to read response body for assertion: {error}"
+                                    ));
+                                }
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
 
-                    // Extract variables if needed (only on success)
-                    if error.is_none() && !scenario.extract.is_empty() {
-                        if let Ok(body) = response.text().await {
-                            self.extract_variables(&body, scenario, &mut variables);
+                    if assertion_error.is_none() {
+                        assertion_error =
+                            response_body_error(body.as_deref(), scenario.assertions.as_ref());
+                    }
+
+                    // Extract variables only after all response assertions pass.
+                    if assertion_error.is_none() && !scenario.extract.is_empty() {
+                        if let Some(body) = body.as_deref() {
+                            self.extract_variables(body, scenario, &mut variables);
                         }
                     }
 
                     // Only mark as executed on a successful response
-                    if error.is_none() {
+                    if assertion_error.is_none() {
                         executed.insert(scenario.name.clone());
                     }
 
@@ -253,7 +278,7 @@ impl Executor {
                         scenario_name: Some(scenario.name.clone()),
                         latency_ms: latency,
                         status_code,
-                        error,
+                        error: assertion_error,
                         request_start_timestamp: start_time,
                         request_end_timestamp: end_time,
                     };
@@ -353,6 +378,37 @@ fn should_retry_response(
     }
 }
 
+fn response_status_error(
+    actual: u16,
+    is_success: bool,
+    assertions: Option<&ResponseAssertions>,
+) -> Option<String> {
+    if let Some(expected) = assertions.and_then(|assertions| assertions.status_code) {
+        if actual != expected {
+            return Some(format!(
+                "Status assertion failed: expected {expected}, received {actual}"
+            ));
+        }
+        return None;
+    }
+
+    (!is_success).then(|| format!("HTTP {actual}"))
+}
+
+fn response_body_error(
+    body: Option<&str>,
+    assertions: Option<&ResponseAssertions>,
+) -> Option<String> {
+    let expected = assertions.and_then(|assertions| assertions.body_contains.as_deref())?;
+    match body {
+        Some(body) if body.contains(expected) => None,
+        Some(_) => Some(format!(
+            "Body assertion failed: response does not contain '{expected}'"
+        )),
+        None => Some("Body assertion failed: response body is unavailable".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,10 +433,12 @@ mod tests {
             retry_count: 0,
             retry_delay: None,
             retry_on_status: vec![],
+            assertions: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
                 html: "/app/results/output.html".to_string(),
+                csv: None,
             },
         };
 
@@ -454,10 +512,12 @@ mod tests {
             retry_count: 1,
             retry_delay: Some("0s".to_string()),
             retry_on_status: vec![503],
+            assertions: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
+                csv: None,
             },
         };
         let metrics = Arc::new(MetricsCollector::new());
@@ -470,5 +530,31 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status_code, 200);
         assert!(results[0].error.is_none());
+    }
+
+    #[test]
+    fn test_response_assertions() {
+        let assertions = ResponseAssertions {
+            status_code: Some(201),
+            body_contains: Some("created".to_string()),
+        };
+
+        assert!(response_status_error(201, true, Some(&assertions)).is_none());
+        assert!(response_status_error(200, true, Some(&assertions))
+            .unwrap()
+            .contains("expected 201"));
+        assert!(response_body_error(Some("resource created"), Some(&assertions)).is_none());
+        assert!(response_body_error(Some("missing"), Some(&assertions))
+            .unwrap()
+            .contains("does not contain"));
+    }
+
+    #[test]
+    fn test_expected_non_success_status_can_pass() {
+        let assertions = ResponseAssertions {
+            status_code: Some(404),
+            body_contains: None,
+        };
+        assert!(response_status_error(404, false, Some(&assertions)).is_none());
     }
 }
