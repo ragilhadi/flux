@@ -81,7 +81,6 @@ retry_count: 2
 retry_delay: "500ms"
 retry_on_status: [502, 503, 504]
 mode: "async"
-prometheus_port: 9090
 
 assertions:
   max_error_rate: 1.0
@@ -93,21 +92,6 @@ output:
   json: "/app/results/output.json"
   html: "/app/results/report.html"
   csv: "/app/results/requests.csv"
-```
-
-### Live Prometheus Metrics
-
-Set `prometheus_port` to expose metrics while a test is running. Omit it to disable the HTTP server.
-
-```yaml
-prometheus_port: 9090
-```
-
-Scrape `http://localhost:9090/metrics` for success and failure counters, latency
-quantiles, and the current request rate:
-
-```bash
-curl http://localhost:9090/metrics
 ```
 
 ### POST with JSON Body
