@@ -264,6 +264,8 @@ impl Config {
             }
         }
 
+        self.validate_scenario_graph()?;
+
         // Validate scenarios
         for scenario in &self.scenarios {
             parse_optional_duration(scenario.think_time.as_deref())?;
@@ -300,6 +302,75 @@ impl Config {
                         );
                     }
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate scenario names and the `depends_on` graph.
+    ///
+    /// Scenarios run in declaration order, so a dependency must name an
+    /// earlier step. Enforcing that here turns typos, duplicate names and
+    /// cycles into configuration errors instead of silently skipped work.
+    fn validate_scenario_graph(&self) -> anyhow::Result<()> {
+        let mut positions: HashMap<&str, usize> = HashMap::new();
+
+        for (index, scenario) in self.scenarios.iter().enumerate() {
+            let step = index + 1;
+            if scenario.name.trim().is_empty() {
+                anyhow::bail!("Scenario at step {step} has an empty 'name'");
+            }
+            if let Some(previous) = positions.insert(scenario.name.as_str(), index) {
+                anyhow::bail!(
+                    "Duplicate scenario name '{}' at steps {} and {}; \
+                     scenario names must be unique because 'depends_on' refers to them",
+                    scenario.name,
+                    previous + 1,
+                    step
+                );
+            }
+        }
+
+        for (index, scenario) in self.scenarios.iter().enumerate() {
+            let Some(depends_on) = scenario.depends_on.as_deref() else {
+                continue;
+            };
+
+            if depends_on.trim().is_empty() {
+                anyhow::bail!(
+                    "Scenario '{}' has an empty 'depends_on'; remove it or name an earlier step",
+                    scenario.name
+                );
+            }
+            if depends_on == scenario.name {
+                anyhow::bail!(
+                    "Scenario '{}' depends on itself; a step cannot wait for its own result",
+                    scenario.name
+                );
+            }
+
+            match positions.get(depends_on) {
+                None => anyhow::bail!(
+                    "Scenario '{}' depends on unknown scenario '{}'; declared scenarios are: {}",
+                    scenario.name,
+                    depends_on,
+                    self.scenarios
+                        .iter()
+                        .map(|scenario| format!("'{}'", scenario.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(&dependency_index) if dependency_index > index => anyhow::bail!(
+                    "Scenario '{}' (step {}) depends on '{}' (step {}), which runs later; \
+                     scenarios execute in declaration order, so a dependency must be \
+                     declared before the step that uses it",
+                    scenario.name,
+                    index + 1,
+                    depends_on,
+                    dependency_index + 1
+                ),
+                Some(_) => {}
             }
         }
 
@@ -775,6 +846,137 @@ mod tests {
         );
     }
 
+    fn scenario(name: &str, depends_on: Option<&str>) -> Scenario {
+        Scenario {
+            name: name.to_string(),
+            method: "GET".to_string(),
+            url: "/".to_string(),
+            headers: HashMap::new(),
+            body: None,
+            multipart: None,
+            extract: HashMap::new(),
+            depends_on: depends_on.map(ToString::to_string),
+            think_time: None,
+            retry_count: None,
+            retry_delay: None,
+            retry_on_status: None,
+            assertions: None,
+        }
+    }
+
+    fn scenario_config(scenarios: Vec<Scenario>) -> Config {
+        Config {
+            target: Some("http://example.com".to_string()),
+            method: Some("GET".to_string()),
+            headers: HashMap::new(),
+            body: None,
+            multipart: None,
+            scenarios,
+            concurrency: 1,
+            duration: "1s".to_string(),
+            timeout: "1s".to_string(),
+            ramp_up: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
+            assertions: None,
+            prometheus_port: None,
+            mode: "async".to_string(),
+            output: OutputConfig {
+                json: "output.json".to_string(),
+                html: "output.html".to_string(),
+                csv: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_valid_dependency_chain_is_accepted() {
+        let config = scenario_config(vec![
+            scenario("login", None),
+            scenario("get-profile", Some("login")),
+            scenario("logout", Some("get-profile")),
+        ]);
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_unknown_dependency_is_rejected() {
+        let config = scenario_config(vec![
+            scenario("login", None),
+            scenario("get-profile", Some("logn")),
+        ]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("unknown scenario 'logn'"), "{error}");
+        assert!(error.contains("'login'"), "{error}");
+    }
+
+    #[test]
+    fn test_duplicate_scenario_names_are_rejected() {
+        let config = scenario_config(vec![
+            scenario("login", None),
+            scenario("checkout", None),
+            scenario("login", None),
+        ]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Duplicate scenario name 'login'"), "{error}");
+        assert!(error.contains("steps 1 and 3"), "{error}");
+    }
+
+    #[test]
+    fn test_empty_scenario_name_is_rejected() {
+        let config = scenario_config(vec![scenario("  ", None)]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("step 1 has an empty 'name'"), "{error}");
+    }
+
+    #[test]
+    fn test_self_dependency_is_rejected() {
+        let config = scenario_config(vec![scenario("login", Some("login"))]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("depends on itself"), "{error}");
+    }
+
+    #[test]
+    fn test_empty_dependency_is_rejected() {
+        let config = scenario_config(vec![scenario("login", Some("  "))]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("empty 'depends_on'"), "{error}");
+    }
+
+    #[test]
+    fn test_forward_dependency_is_rejected() {
+        let config = scenario_config(vec![
+            scenario("get-profile", Some("login")),
+            scenario("login", None),
+        ]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("which runs later"), "{error}");
+        assert!(error.contains("declaration order"), "{error}");
+    }
+
+    #[test]
+    fn test_dependency_cycle_is_rejected() {
+        // A cycle always contains at least one step that depends on a later
+        // step, so it cannot survive validation.
+        let config = scenario_config(vec![
+            scenario("a", Some("b")),
+            scenario("b", Some("c")),
+            scenario("c", Some("a")),
+        ]);
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("runs later"), "{error}");
+    }
+
     #[test]
     fn test_aggregate_assertion_evaluation() {
         let config = Config {
@@ -826,6 +1028,7 @@ mod tests {
             start_time: chrono::Utc::now(),
             end_time: chrono::Utc::now(),
             per_scenario: Default::default(),
+            skipped_scenarios: Default::default(),
         };
 
         let failures = config.evaluate_assertions(&summary);

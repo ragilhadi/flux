@@ -128,6 +128,22 @@ impl TerminalUI {
             }
         );
 
+        if !summary.skipped_scenarios.is_empty() {
+            println!(
+                "\n{}",
+                "Skipped Steps (dependency failed at runtime):"
+                    .bright_yellow()
+                    .bold()
+            );
+            for (name, count) in &summary.skipped_scenarios {
+                println!(
+                    "  {:<25} : {}",
+                    name.bright_white(),
+                    count.to_string().bright_yellow()
+                );
+            }
+        }
+
         // Performance metrics
         println!("\n{}", "Performance Metrics:".bright_green().bold());
         println!(
@@ -260,6 +276,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: Default::default(),
+            skipped_scenarios: Default::default(),
         };
 
         // This will print to stdout, but we're just testing it doesn't panic
