@@ -162,6 +162,43 @@ output:
   html: "/app/results/report.html"
 ```
 
+### Multipart Upload With Scenario Variables
+
+Inside scenarios, `{{ variable }}` placeholders are substituted in multipart
+field names, field values and file paths, using variables extracted by earlier
+steps:
+
+```yaml
+scenarios:
+  - name: "login"
+    method: "POST"
+    url: "/login"
+    body: '{"user":"demo","password":"demo"}'
+    extract:
+      token: "$.token"
+      file_name: "$.upload.file_name"
+
+  - name: "upload"
+    method: "POST"
+    url: "/uploads"
+    depends_on: "login"
+    multipart:
+      - type: "field"
+        name: "session"
+        value: "{{ token }}"
+
+      - type: "file"
+        name: "attachment"
+        path: "/app/data/{{ file_name }}"
+```
+
+If a placeholder cannot be resolved — a typo, or a variable no earlier step
+extracted — the step fails with an explicit error and the request is *not*
+sent, so the target never receives a literal `{{ token }}`.
+
+Simple (non-scenario) multipart has no variables to substitute and is sent
+exactly as written.
+
 ### Multi-Step Scenario with Variable Extraction
 
 ```yaml
