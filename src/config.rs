@@ -232,11 +232,9 @@ impl Config {
 
         self.parse_duration()?;
         self.parse_timeout()?;
-        if let Some(ramp_up) = self.parse_ramp_up()? {
-            if ramp_up > Duration::from_secs(self.parse_duration()?) {
-                anyhow::bail!("Ramp-up duration cannot exceed the test duration");
-            }
-        }
+        // Ramp-up is warm-up time added in front of the measured window, so it
+        // is allowed to be longer than the configured duration.
+        self.parse_ramp_up()?;
         self.parse_think_time()?;
         self.parse_retry_delay()?;
         validate_status_codes(&self.retry_on_status, "retry_on_status")?;
@@ -767,12 +765,14 @@ mod tests {
         );
         assert_eq!(config.parse_retry_delay().unwrap(), Duration::ZERO);
 
+        // Ramp-up is warm-up time in front of the measured window, so a ramp-up
+        // longer than the duration is valid: the run simply takes longer.
         config.ramp_up = Some("31s".to_string());
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("Ramp-up"));
+        config.validate().unwrap();
+        assert_eq!(
+            config.parse_ramp_up().unwrap(),
+            Some(Duration::from_secs(31))
+        );
     }
 
     #[test]
@@ -811,6 +811,9 @@ mod tests {
             successful_requests: 95,
             failed_requests: 5,
             total_duration_secs: 1.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 1.0,
+            measured_requests: 0,
             throughput_rps: 100.0,
             min_latency_ms: 10,
             max_latency_ms: 800,

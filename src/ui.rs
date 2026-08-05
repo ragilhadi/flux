@@ -40,7 +40,11 @@ impl TerminalUI {
         );
         println!("{:<20} : {}s", "Duration".bright_yellow(), duration_secs);
         if let Some(ramp_up) = &config.ramp_up {
-            println!("{:<20} : {}", "Ramp-up".bright_yellow(), ramp_up);
+            println!(
+                "{:<20} : {} (warm-up, added before the measured duration)",
+                "Ramp-up".bright_yellow(),
+                ramp_up
+            );
         }
         if let Some(think_time) = &config.think_time {
             println!("{:<20} : {}", "Think time".bright_yellow(), think_time);
@@ -127,9 +131,14 @@ impl TerminalUI {
         // Performance metrics
         println!("\n{}", "Performance Metrics:".bright_green().bold());
         println!(
-            "  {:<25} : {:.2} req/s",
+            "  {:<25} : {:.2} req/s{}",
             "Throughput".bright_white(),
-            summary.throughput_rps
+            summary.throughput_rps,
+            if summary.ramp_up_secs > 0.0 {
+                " (measured window, ramp-up excluded)"
+            } else {
+                ""
+            }
         );
         println!(
             "  {:<25} : {:.2}%",
@@ -145,6 +154,19 @@ impl TerminalUI {
             "Total Duration".bright_white(),
             summary.total_duration_secs
         );
+        if summary.ramp_up_secs > 0.0 {
+            println!(
+                "  {:<25} : {:.2}s",
+                "Ramp-up (excluded)".bright_white(),
+                summary.ramp_up_secs
+            );
+            println!(
+                "  {:<25} : {:.2}s ({} requests)",
+                "Measured Duration".bright_white(),
+                summary.measured_duration_secs,
+                summary.measured_requests
+            );
+        }
 
         // Latency percentiles
         println!("\n{}", "Latency Percentiles:".bright_green().bold());
@@ -223,6 +245,9 @@ mod tests {
             successful_requests: 950,
             failed_requests: 50,
             total_duration_secs: 30.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 30.0,
+            measured_requests: 0,
             throughput_rps: 33.33,
             min_latency_ms: 10,
             max_latency_ms: 500,

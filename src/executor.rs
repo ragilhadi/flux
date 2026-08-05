@@ -37,13 +37,18 @@ impl Executor {
 
     /// Run the load test
     pub async fn run(&self, duration_secs: u64) -> Result<()> {
-        let start = Instant::now();
         let duration = Duration::from_secs(duration_secs);
         let ramp_up = self.config.parse_ramp_up()?;
-        self.run_workers(start, duration, ramp_up).await
+        self.run_workers(Instant::now(), duration, ramp_up).await
     }
 
-    /// Start workers, optionally spreading their startup across a ramp-up period.
+    /// Start workers, optionally spreading their startup across a ramp-up
+    /// period.
+    ///
+    /// Ramp-up is warm-up time that precedes the measured window: the
+    /// configured `duration` starts once the last worker has been started, so
+    /// every worker gets a full-length active period rather than losing its
+    /// share of the run to the time it waited to start.
     async fn run_workers(
         &self,
         start: Instant,
@@ -53,6 +58,7 @@ impl Executor {
         let mut handles = vec![];
         let start_delay =
             worker_start_delay(self.config.concurrency, ramp_up, self.config.mode == "sync");
+        let deadline = start + startup_span(self.config.concurrency, start_delay) + duration;
 
         for worker_id in 0..self.config.concurrency {
             // Stop spawning additional workers once cancellation is requested.
@@ -62,13 +68,9 @@ impl Executor {
             }
 
             let executor = self.clone_for_worker();
-            let start_clone = start;
-            let duration_clone = duration;
 
             let handle = tokio::spawn(async move {
-                executor
-                    .worker_loop(worker_id, start_clone, duration_clone)
-                    .await;
+                executor.worker_loop(worker_id, deadline).await;
             });
 
             handles.push(handle);
@@ -81,6 +83,9 @@ impl Executor {
             }
         }
 
+        // Every worker is running: the measured load window starts here.
+        self.metrics.mark_load_phase_started();
+
         // Wait for all workers to complete
         for handle in handles {
             let _ = handle.await;
@@ -89,11 +94,11 @@ impl Executor {
         Ok(())
     }
 
-    /// Worker loop that executes requests
-    async fn worker_loop(&self, worker_id: usize, start: Instant, duration: Duration) {
+    /// Worker loop that executes requests until the shared test deadline.
+    async fn worker_loop(&self, worker_id: usize, deadline: Instant) {
         debug!("Worker {} started", worker_id);
 
-        while start.elapsed() < duration && !self.cancellation.is_cancelled() {
+        while Instant::now() < deadline && !self.cancellation.is_cancelled() {
             if self.config.is_simple_mode() {
                 self.execute_simple_request().await;
                 if let Some(think_time) = self
@@ -393,6 +398,13 @@ impl Executor {
     }
 }
 
+/// Total time spent starting workers: the delay applies between starts, so the
+/// first worker starts immediately and the last one starts after `n - 1` gaps.
+fn startup_span(concurrency: usize, start_delay: Duration) -> Duration {
+    let gaps = u32::try_from(concurrency.saturating_sub(1)).unwrap_or(u32::MAX);
+    start_delay.saturating_mul(gaps)
+}
+
 fn worker_start_delay(concurrency: usize, ramp_up: Option<Duration>, sync_mode: bool) -> Duration {
     match ramp_up {
         Some(ramp_up) => Duration::from_secs_f64(ramp_up.as_secs_f64() / concurrency as f64),
@@ -509,6 +521,99 @@ mod tests {
             worker_start_delay(10, None, true),
             Duration::from_millis(10)
         );
+    }
+
+    #[test]
+    fn test_startup_span_covers_every_worker_start() {
+        // 10 workers one second apart: the last one starts after nine seconds.
+        assert_eq!(
+            startup_span(
+                10,
+                worker_start_delay(10, Some(Duration::from_secs(10)), false)
+            ),
+            Duration::from_secs(9)
+        );
+        // A single worker starts immediately, so there is no ramp-up to absorb.
+        assert_eq!(
+            startup_span(
+                1,
+                worker_start_delay(1, Some(Duration::from_secs(10)), false)
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(startup_span(10, Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Every worker must get its full active window regardless of when it
+    /// started, so the deadline is pushed out by the whole ramp-up span.
+    #[test]
+    fn test_deadline_gives_each_worker_the_full_duration() {
+        let duration = Duration::from_secs(10);
+        let start = Instant::now();
+
+        for (concurrency, ramp_up) in [
+            (10, Some(Duration::from_secs(10))),
+            (10, None),
+            (1, Some(Duration::from_secs(10))),
+            (1, None),
+        ] {
+            let start_delay = worker_start_delay(concurrency, ramp_up, false);
+            let deadline = start + startup_span(concurrency, start_delay) + duration;
+
+            for worker_id in 0..concurrency {
+                let worker_start = start + start_delay * worker_id as u32;
+                assert!(
+                    deadline.duration_since(worker_start) >= duration,
+                    "worker {worker_id} of {concurrency} lost part of its window"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ramp_up_equal_to_duration_still_runs_every_worker() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.concurrency = 4;
+        // Ramp-up as long as the duration used to leave the last workers with
+        // no time to send a single request.
+        config.ramp_up = Some("2s".to_string());
+        config.duration = "2s".to_string();
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        let started = Instant::now();
+        executor.run(2).await.unwrap();
+        server.abort();
+
+        // Ramp-up (1.5s of gaps) is additive, so the run takes longer than the
+        // configured duration but each worker gets its own two seconds.
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        let summary = metrics.generate_summary();
+        assert!(summary.total_requests > 0);
+        assert!(summary.ramp_up_secs > 0.0);
+        assert!(summary.measured_duration_secs >= 1.5);
+        assert!(summary.measured_requests > 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_ramp_up_leaves_timing_unchanged() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.concurrency = 2;
+        config.duration = "1s".to_string();
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        let started = Instant::now();
+        executor.run(1).await.unwrap();
+        server.abort();
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let summary = metrics.generate_summary();
+        assert!(summary.ramp_up_secs < 0.5);
+        assert!(summary.measured_requests > 0);
+        assert!(summary.measured_requests <= summary.total_requests);
     }
 
     #[tokio::test]
