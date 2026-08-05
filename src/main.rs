@@ -1,3 +1,4 @@
+mod cancel;
 mod client;
 mod config;
 mod executor;
@@ -7,6 +8,7 @@ mod reporter;
 mod ui;
 
 use anyhow::Result;
+use cancel::Cancellation;
 use clap::Parser;
 use config::Config;
 use executor::Executor;
@@ -16,7 +18,6 @@ use reporter::Reporter;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info};
@@ -108,21 +109,26 @@ async fn main() -> Result<()> {
     let ui = TerminalUI::new(duration_secs);
     ui.display_banner(&config, duration_secs);
 
-    // Setup graceful shutdown
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+    // Setup graceful shutdown: SIGINT and SIGTERM share one cancellation path.
+    let cancellation = Cancellation::new();
+    let signal_cancellation = cancellation.clone();
 
     tokio::spawn(async move {
         use futures::stream::StreamExt;
         let mut signals = Signals::new([SIGTERM, SIGINT]).expect("Failed to create signal handler");
         if let Some(signal) = signals.next().await {
-            info!("Received signal: {:?}", signal);
-            shutdown_flag_clone.store(true, Ordering::SeqCst);
+            let name = match signal {
+                SIGINT => "SIGINT",
+                SIGTERM => "SIGTERM",
+                _ => "signal",
+            };
+            info!("Received {name}; stopping the load test and generating reports");
+            signal_cancellation.cancel();
         }
     });
 
     // Create executor
-    let executor = match Executor::new(config.clone(), Arc::clone(&metrics)) {
+    let executor = match Executor::new(config.clone(), Arc::clone(&metrics), cancellation.clone()) {
         Ok(exec) => exec,
         Err(e) => {
             ui.display_error(&format!("Failed to create executor: {}", e));
@@ -149,12 +155,17 @@ async fn main() -> Result<()> {
 
     // Start live metrics update task
     let metrics_clone = Arc::clone(&metrics);
+    let ui_cancellation = cancellation.clone();
     let ui_handle = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
         let mut elapsed = 0u64;
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = ui_cancellation.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
             elapsed += 1;
 
             let live_metrics = metrics_clone.get_live_metrics();
@@ -194,6 +205,9 @@ async fn main() -> Result<()> {
 
     // Display summary in terminal
     let ui = TerminalUI::new(duration_secs);
+    if cancellation.is_cancelled() {
+        ui.display_warning("Load test cancelled early; reporting completed requests only");
+    }
     ui.display_summary(&summary);
 
     // Generate reports

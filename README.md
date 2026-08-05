@@ -320,6 +320,27 @@ Run `flux --help` for the complete flag reference.
 
 ---
 
+## 🛑 Stopping a Test Early
+
+`SIGINT` (Ctrl+C) and `SIGTERM` both cancel a running test immediately and take
+the same shutdown path:
+
+- no new workers are started and no new requests are issued;
+- ramp-up pauses, think time, retry delays, and the sync-mode pacing delay wake
+  up right away instead of waiting out their configured duration;
+- in-flight requests are awaited, or end through the configured `timeout`;
+- the terminal summary and the JSON/HTML/CSV reports are still generated from
+  the requests that completed before cancellation.
+
+Because the run stops early, the reported duration and throughput cover only the
+elapsed part of the test.
+
+```bash
+docker run --rm --name flux-run ... flux:latest
+# in another shell
+docker stop flux-run     # SIGTERM: reports are still written
+```
+
 ## 📈 Metrics Collected
 
 Flux collects comprehensive metrics for each request:
@@ -459,6 +480,7 @@ See the `samples/` directory for complete examples:
 flux/
 ├── src/
 │   ├── main.rs              # Entry point and orchestration
+│   ├── cancel.rs            # Cooperative cancellation token
 │   ├── config.rs            # YAML configuration parsing
 │   ├── client.rs            # HTTP client wrapper
 │   ├── executor.rs          # Load test execution engine

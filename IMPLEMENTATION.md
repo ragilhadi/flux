@@ -149,7 +149,7 @@ Flux is a high-performance, container-native load testing tool built in Rust. Th
 **Flow**:
 1. Initialize logging with tracing
 2. Load and validate configuration
-3. Setup graceful shutdown handler
+3. Setup graceful shutdown handler shared with the executor (`Cancellation`)
 4. Create metrics collector
 5. Display initial banner
 6. Start executor
@@ -302,7 +302,9 @@ scenarios:
 
 - Invalid JSONPath: Log warning, continue
 - Network errors: Record as failed request
-- Signal handling: Clean shutdown on SIGTERM
+- Signal handling: `SIGINT`/`SIGTERM` cancel the run through a shared
+  cancellation token (`src/cancel.rs`); workers stop between requests,
+  interruptible sleeps wake immediately, and reports are still generated
 
 ## Security Considerations
 
