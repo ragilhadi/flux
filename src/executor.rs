@@ -1,3 +1,4 @@
+use crate::cancel::Cancellation;
 use crate::client::HttpClient;
 use crate::config::{Config, ResponseAssertions, Scenario};
 use crate::metrics::{MetricsCollector, RequestResult};
@@ -7,7 +8,7 @@ use jsonpath_rust::JsonPath;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tracing::{debug, error, warn};
 
 /// Executor for running load tests
@@ -15,16 +16,22 @@ pub struct Executor {
     config: Config,
     client: HttpClient,
     metrics: Arc<MetricsCollector>,
+    cancellation: Cancellation,
 }
 
 impl Executor {
     /// Create a new executor
-    pub fn new(config: Config, metrics: Arc<MetricsCollector>) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        metrics: Arc<MetricsCollector>,
+        cancellation: Cancellation,
+    ) -> Result<Self> {
         let client = HttpClient::new(config.parse_timeout()?)?;
         Ok(Self {
             config,
             client,
             metrics,
+            cancellation,
         })
     }
 
@@ -48,6 +55,12 @@ impl Executor {
             worker_start_delay(self.config.concurrency, ramp_up, self.config.mode == "sync");
 
         for worker_id in 0..self.config.concurrency {
+            // Stop spawning additional workers once cancellation is requested.
+            if self.cancellation.is_cancelled() {
+                debug!("Cancellation requested; not starting worker {}", worker_id);
+                break;
+            }
+
             let executor = self.clone_for_worker();
             let start_clone = start;
             let duration_clone = duration;
@@ -59,8 +72,12 @@ impl Executor {
             });
 
             handles.push(handle);
-            if worker_id + 1 < self.config.concurrency && !start_delay.is_zero() {
-                sleep(start_delay).await;
+            if worker_id + 1 < self.config.concurrency
+                && !start_delay.is_zero()
+                && !self.cancellation.sleep(start_delay).await
+            {
+                debug!("Cancellation requested during ramp-up");
+                break;
             }
         }
 
@@ -76,7 +93,7 @@ impl Executor {
     async fn worker_loop(&self, worker_id: usize, start: Instant, duration: Duration) {
         debug!("Worker {} started", worker_id);
 
-        while start.elapsed() < duration {
+        while start.elapsed() < duration && !self.cancellation.is_cancelled() {
             if self.config.is_simple_mode() {
                 self.execute_simple_request().await;
                 if let Some(think_time) = self
@@ -84,15 +101,19 @@ impl Executor {
                     .parse_think_time()
                     .expect("Validated think_time became invalid")
                 {
-                    sleep(think_time).await;
+                    if !self.cancellation.sleep(think_time).await {
+                        break;
+                    }
                 }
             } else {
                 self.execute_scenarios().await;
             }
 
             // Small delay in sync mode
-            if self.config.mode == "sync" {
-                sleep(Duration::from_millis(10)).await;
+            if self.config.mode == "sync"
+                && !self.cancellation.sleep(Duration::from_millis(10)).await
+            {
+                break;
             }
         }
 
@@ -124,6 +145,7 @@ impl Executor {
             let end_time = Utc::now();
 
             if attempt < self.config.retry_count
+                && !self.cancellation.is_cancelled()
                 && should_retry_response(&result, &self.config.retry_on_status)
             {
                 attempt += 1;
@@ -132,8 +154,8 @@ impl Executor {
                     attempt,
                     self.config.retry_count.saturating_add(1)
                 );
-                if !retry_delay.is_zero() {
-                    sleep(retry_delay).await;
+                if !self.cancellation.sleep(retry_delay).await {
+                    break (result, start_time, end_time, latency);
                 }
                 continue;
             }
@@ -180,6 +202,11 @@ impl Executor {
         let mut executed: HashSet<String> = HashSet::new();
 
         for scenario in &self.config.scenarios {
+            if self.cancellation.is_cancelled() {
+                debug!("Cancellation requested; stopping scenario sequence");
+                break;
+            }
+
             // Check dependencies
             if let Some(ref depends_on) = scenario.depends_on {
                 if !Self::has_executed_scenario(depends_on, &executed) {
@@ -209,7 +236,10 @@ impl Executor {
                 let latency = request_start.elapsed().as_millis() as u64;
                 let end_time = Utc::now();
 
-                if attempt < retry_count && should_retry_response(&result, retry_statuses) {
+                if attempt < retry_count
+                    && !self.cancellation.is_cancelled()
+                    && should_retry_response(&result, retry_statuses)
+                {
                     attempt += 1;
                     debug!(
                         "Retrying scenario '{}' after attempt {} of {}",
@@ -217,8 +247,8 @@ impl Executor {
                         attempt,
                         retry_count.saturating_add(1)
                     );
-                    if !retry_delay.is_zero() {
-                        sleep(retry_delay).await;
+                    if !self.cancellation.sleep(retry_delay).await {
+                        break (result, start_time, end_time, latency);
                     }
                     continue;
                 }
@@ -306,7 +336,9 @@ impl Executor {
                 .parse_think_time_for(scenario)
                 .expect("Validated scenario think_time became invalid")
             {
-                sleep(think_time).await;
+                if !self.cancellation.sleep(think_time).await {
+                    break;
+                }
             }
         }
     }
@@ -356,6 +388,7 @@ impl Executor {
             client: HttpClient::new(self.config.parse_timeout().expect("Invalid timeout"))
                 .expect("Failed to create client"),
             metrics: Arc::clone(&self.metrics),
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -415,6 +448,7 @@ mod tests {
     use crate::config::OutputConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::time::sleep;
 
     #[test]
     fn test_executor_creation() {
@@ -444,7 +478,7 @@ mod tests {
         };
 
         let metrics = Arc::new(MetricsCollector::new());
-        let executor = Executor::new(config, metrics);
+        let executor = Executor::new(config, metrics, Cancellation::new());
 
         assert!(executor.is_ok());
     }
@@ -523,7 +557,7 @@ mod tests {
             },
         };
         let metrics = Arc::new(MetricsCollector::new());
-        let executor = Executor::new(config, Arc::clone(&metrics)).unwrap();
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
 
         executor.execute_simple_request().await;
         server.await.unwrap();
@@ -558,5 +592,130 @@ mod tests {
             body_contains: None,
         };
         assert!(response_status_error(404, false, Some(&assertions)).is_none());
+    }
+
+    /// Accept connections until dropped, always answering with `status`.
+    async fn spawn_status_server(
+        status: u16,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let _ = socket.read(&mut request).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (address, handle)
+    }
+
+    fn cancellation_test_config(target: String) -> Config {
+        Config {
+            target: Some(target),
+            method: Some("GET".to_string()),
+            headers: HashMap::new(),
+            body: None,
+            multipart: None,
+            scenarios: vec![],
+            concurrency: 1,
+            duration: "300s".to_string(),
+            timeout: "5s".to_string(),
+            ramp_up: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
+            assertions: None,
+            prometheus_port: None,
+            mode: "async".to_string(),
+            output: OutputConfig {
+                json: "output.json".to_string(),
+                html: "output.html".to_string(),
+                csv: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_stops_active_run() {
+        let (address, server) = spawn_status_server(200).await;
+        let config = cancellation_test_config(format!("http://{address}"));
+        let metrics = Arc::new(MetricsCollector::new());
+        let cancellation = Cancellation::new();
+        let executor = Executor::new(config, Arc::clone(&metrics), cancellation.clone()).unwrap();
+
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        executor.run(300).await.unwrap();
+        server.abort();
+
+        // Without cancellation this would run for the configured 300 seconds.
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(!metrics.get_results().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_during_ramp_up_stops_spawning_workers() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.concurrency = 20;
+        config.ramp_up = Some("200s".to_string());
+        let metrics = Arc::new(MetricsCollector::new());
+        let cancellation = Cancellation::new();
+        let executor = Executor::new(config, Arc::clone(&metrics), cancellation.clone()).unwrap();
+
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        executor.run(300).await.unwrap();
+        server.abort();
+
+        // Each worker start is 10s apart, so only cancellation can end this quickly.
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_interrupts_retry_delay() {
+        let (address, server) = spawn_status_server(503).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.retry_count = 3;
+        config.retry_delay = Some("120s".to_string());
+        config.retry_on_status = vec![503];
+        let metrics = Arc::new(MetricsCollector::new());
+        let cancellation = Cancellation::new();
+        let executor = Executor::new(config, Arc::clone(&metrics), cancellation.clone()).unwrap();
+
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        executor.execute_simple_request().await;
+        server.abort();
+
+        assert!(started.elapsed() < Duration::from_secs(30));
+        let results = metrics.get_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status_code, 503);
     }
 }

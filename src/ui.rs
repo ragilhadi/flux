@@ -193,6 +193,11 @@ impl TerminalUI {
         eprintln!("\n{} {}", "❌ Error:".bright_red().bold(), message);
     }
 
+    /// Display warning message
+    pub fn display_warning(&self, message: &str) {
+        println!("\n{} {}", "⚠️  Warning:".bright_yellow().bold(), message);
+    }
+
     /// Display success message
     pub fn display_success(&self, message: &str) {
         println!("\n{} {}", "✅".bright_green(), message);
