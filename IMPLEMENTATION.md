@@ -306,6 +306,17 @@ scenarios:
   cancellation token (`src/cancel.rs`); workers stop between requests,
   interruptible sleeps wake immediately, and reports are still generated
 
+### Bounded Memory
+
+`MetricsCollector` keeps streaming aggregates (counters, an HDR histogram, and
+one histogram per scenario) plus a capped buffer of raw `RequestResult` rows.
+The cap comes from `output.max_results` and only affects the per-request rows
+embedded in reports; every statistic is computed on the way in, so a long or
+high-throughput run uses a bounded amount of memory. Dropped rows are counted
+and reported. When `output.csv` is configured, results are also forwarded to a
+background writer task that appends rows to the file as they arrive, so the CSV
+stays complete without retaining anything.
+
 ## Security Considerations
 
 ### Docker

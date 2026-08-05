@@ -128,6 +128,16 @@ impl TerminalUI {
             }
         );
 
+        if summary.dropped_results > 0 {
+            println!(
+                "  {:<25} : {} of {} (per-request rows in reports; \
+                 statistics above cover every request)",
+                "Retained Results".bright_white(),
+                summary.retained_results.to_string().bright_cyan(),
+                summary.total_requests
+            );
+        }
+
         if !summary.skipped_scenarios.is_empty() {
             println!(
                 "\n{}",
@@ -277,6 +287,8 @@ mod tests {
             end_time: Utc::now(),
             per_scenario: Default::default(),
             skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
         };
 
         // This will print to stdout, but we're just testing it doesn't panic

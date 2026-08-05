@@ -4,6 +4,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 use tera::{Context, Tera};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::task::JoinHandle;
 
 /// Report data structure
 #[derive(Debug, Serialize)]
@@ -48,31 +50,6 @@ impl Reporter {
         ensure_parent_directory(output_path)?;
 
         fs::write(output_path, html)?;
-        Ok(())
-    }
-
-    /// Generate a CSV report with one row per request.
-    pub fn generate_csv(&self, output_path: &str) -> Result<()> {
-        ensure_parent_directory(output_path)?;
-
-        let mut writer = csv::Writer::from_path(output_path)?;
-        writer.write_record([
-            "timestamp",
-            "scenario",
-            "latency_ms",
-            "status_code",
-            "error",
-        ])?;
-        for result in &self.report.results {
-            writer.write_record([
-                result.request_start_timestamp.to_rfc3339(),
-                result.scenario_name.clone().unwrap_or_default(),
-                result.latency_ms.to_string(),
-                result.status_code.to_string(),
-                result.error.clone().unwrap_or_default(),
-            ])?;
-        }
-        writer.flush()?;
         Ok(())
     }
 
@@ -154,6 +131,67 @@ impl Reporter {
     }
 }
 
+/// Incremental CSV writer for per-request rows.
+///
+/// Rows are written as they are produced, so a full-fidelity CSV never needs
+/// every request to be held in memory first.
+pub struct CsvResultStream {
+    sender: Option<UnboundedSender<RequestResult>>,
+    writer: JoinHandle<Result<usize>>,
+}
+
+impl CsvResultStream {
+    /// Open `output_path` and start the background writer task.
+    pub fn create(output_path: &str) -> Result<Self> {
+        ensure_parent_directory(output_path)?;
+
+        let mut writer = csv::Writer::from_path(output_path)?;
+        writer.write_record([
+            "timestamp",
+            "scenario",
+            "latency_ms",
+            "status_code",
+            "error",
+        ])?;
+
+        let (sender, mut receiver) = unbounded_channel::<RequestResult>();
+        let task = tokio::spawn(async move {
+            let mut rows = 0_usize;
+            while let Some(result) = receiver.recv().await {
+                writer.write_record([
+                    result.request_start_timestamp.to_rfc3339(),
+                    result.scenario_name.clone().unwrap_or_default(),
+                    result.latency_ms.to_string(),
+                    result.status_code.to_string(),
+                    result.error.clone().unwrap_or_default(),
+                ])?;
+                rows += 1;
+            }
+            writer.flush()?;
+            Ok(rows)
+        });
+
+        Ok(Self {
+            sender: Some(sender),
+            writer: task,
+        })
+    }
+
+    /// Channel every recorded result should be forwarded to.
+    pub fn sender(&self) -> UnboundedSender<RequestResult> {
+        self.sender
+            .clone()
+            .expect("sender is only taken when finishing the stream")
+    }
+
+    /// Close the stream and flush the file, returning the number of rows.
+    pub async fn finish(mut self) -> Result<usize> {
+        // Dropping every sender ends the writer loop.
+        self.sender.take();
+        self.writer.await?
+    }
+}
+
 fn ensure_parent_directory(output_path: &str) -> Result<()> {
     if let Some(parent) = Path::new(output_path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -219,6 +257,8 @@ mod tests {
             end_time: Utc::now(),
             per_scenario: Default::default(),
             skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
         };
 
         let reporter = Reporter::new(summary, results);
@@ -229,49 +269,46 @@ mod tests {
         assert_eq!(distribution[2].count, 1); // 100-200ms
     }
 
-    #[test]
-    fn test_csv_output() {
-        let result = RequestResult {
-            scenario_name: Some("login".to_string()),
-            latency_ms: 42,
-            status_code: 500,
-            error: Some("failed, temporarily".to_string()),
-            request_start_timestamp: Utc::now(),
-            request_end_timestamp: Utc::now(),
-        };
-        let summary = MetricsSummary {
-            total_requests: 1,
-            successful_requests: 0,
-            failed_requests: 1,
-            total_duration_secs: 1.0,
-            ramp_up_secs: 0.0,
-            measured_duration_secs: 1.0,
-            measured_requests: 0,
-            throughput_rps: 1.0,
-            min_latency_ms: 42,
-            max_latency_ms: 42,
-            mean_latency_ms: 42.0,
-            p50_latency_ms: 42,
-            p90_latency_ms: 42,
-            p95_latency_ms: 42,
-            p99_latency_ms: 42,
-            error_rate: 100.0,
-            start_time: Utc::now(),
-            end_time: Utc::now(),
-            per_scenario: Default::default(),
-            skipped_scenarios: Default::default(),
-        };
-        let reporter = Reporter::new(summary, vec![result]);
+    #[tokio::test]
+    async fn test_csv_stream_writes_every_row() {
         let path = std::env::temp_dir().join(format!(
             "flux-report-{}-{}.csv",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
 
-        reporter.generate_csv(path.to_str().unwrap()).unwrap();
+        let stream = CsvResultStream::create(path.to_str().unwrap()).unwrap();
+        let sender = stream.sender();
+        sender
+            .send(RequestResult {
+                scenario_name: Some("login".to_string()),
+                latency_ms: 42,
+                status_code: 500,
+                error: Some("failed, temporarily".to_string()),
+                request_start_timestamp: Utc::now(),
+                request_end_timestamp: Utc::now(),
+            })
+            .unwrap();
+        for latency in 0..100 {
+            sender
+                .send(RequestResult {
+                    scenario_name: None,
+                    latency_ms: latency,
+                    status_code: 200,
+                    error: None,
+                    request_start_timestamp: Utc::now(),
+                    request_end_timestamp: Utc::now(),
+                })
+                .unwrap();
+        }
+        drop(sender);
+
+        let rows = stream.finish().await.unwrap();
         let csv = fs::read_to_string(&path).unwrap();
         fs::remove_file(path).unwrap();
 
+        assert_eq!(rows, 101);
+        assert_eq!(csv.lines().count(), 102);
         assert!(csv.starts_with("timestamp,scenario,latency_ms,status_code,error"));
         assert!(csv.contains("login,42,500,\"failed, temporarily\""));
     }
@@ -313,11 +350,49 @@ mod tests {
             end_time: Utc::now(),
             per_scenario: std::collections::BTreeMap::from([("login".to_string(), scenario)]),
             skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
         };
         let reporter = Reporter::new(summary, Vec::new());
 
         let html = reporter.render_html().unwrap();
         assert!(html.contains("Per-Scenario Metrics"));
         assert!(html.contains("login"));
+        // Nothing was dropped, so the retention notice stays out of the report.
+        assert!(!html.contains("Retained Results"));
+    }
+
+    #[test]
+    fn test_html_states_retained_and_dropped_results() {
+        let summary = MetricsSummary {
+            total_requests: 1_000,
+            successful_requests: 1_000,
+            failed_requests: 0,
+            total_duration_secs: 1.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 1.0,
+            measured_requests: 1_000,
+            throughput_rps: 1_000.0,
+            min_latency_ms: 10,
+            max_latency_ms: 20,
+            mean_latency_ms: 15.0,
+            p50_latency_ms: 10,
+            p90_latency_ms: 20,
+            p95_latency_ms: 20,
+            p99_latency_ms: 20,
+            error_rate: 0.0,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            per_scenario: Default::default(),
+            skipped_scenarios: Default::default(),
+            retained_results: 100,
+            dropped_results: 900,
+        };
+        let reporter = Reporter::new(summary, Vec::new());
+
+        let html = reporter.render_html().unwrap();
+        assert!(html.contains("Retained Results"));
+        assert!(html.contains("100 of"), "{html}");
+        assert!(html.contains("900 per-request"), "{html}");
     }
 }

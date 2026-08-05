@@ -490,6 +490,7 @@ mod tests {
                 json: "/app/results/output.json".to_string(),
                 html: "/app/results/output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
 
@@ -663,6 +664,7 @@ mod tests {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
         let metrics = Arc::new(MetricsCollector::new());
@@ -750,6 +752,7 @@ mod tests {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         }
     }
