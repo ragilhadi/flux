@@ -183,7 +183,7 @@
                     <div class="value">{{ summary.successful_requests }}<span class="unit">/ {{ summary.total_requests }}</span></div>
                 </div>
                 <div class="metric-card">
-                    <h3>Throughput</h3>
+                    <h3>Throughput{% if summary.ramp_up_secs > 0 %} (excl. ramp-up){% endif %}</h3>
                     <div class="value">{{ summary.throughput_rps | round(precision=2) }}<span class="unit">req/s</span></div>
                 </div>
                 <div class="metric-card">
@@ -198,6 +198,16 @@
                     <h3>Duration</h3>
                     <div class="value">{{ summary.total_duration_secs | round(precision=2) }}<span class="unit">s</span></div>
                 </div>
+                {% if summary.ramp_up_secs > 0 %}
+                <div class="metric-card">
+                    <h3>Ramp-up (excluded)</h3>
+                    <div class="value">{{ summary.ramp_up_secs | round(precision=2) }}<span class="unit">s</span></div>
+                </div>
+                <div class="metric-card">
+                    <h3>Measured Duration</h3>
+                    <div class="value">{{ summary.measured_duration_secs | round(precision=2) }}<span class="unit">s</span></div>
+                </div>
+                {% endif %}
             </div>
 
             {% if summary.per_scenario | length > 0 %}

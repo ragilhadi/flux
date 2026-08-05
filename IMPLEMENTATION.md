@@ -324,7 +324,9 @@ scenarios:
 
 ### Load Patterns
 
-- Ramp-up: Gradually increase load
+- Ramp-up: Gradually increase load. Ramp-up is warm-up time that runs before
+  the measured window, so the configured `duration` begins once every worker is
+  started and each worker gets a full-length active period
 - Spike: Sudden load increase
 - Soak: Sustained load over time
 

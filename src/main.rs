@@ -102,11 +102,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Ramp-up precedes the measured window, so the run lasts ramp-up + duration.
+    let ramp_up_secs = match config.parse_ramp_up() {
+        Ok(ramp_up) => ramp_up.map(|ramp_up| ramp_up.as_secs()).unwrap_or(0),
+        Err(e) => {
+            eprintln!("Failed to parse ramp-up: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let total_secs = duration_secs.saturating_add(ramp_up_secs);
+
     // Create metrics collector
     let metrics = Arc::new(MetricsCollector::new());
 
     // Create terminal UI
-    let ui = TerminalUI::new(duration_secs);
+    let ui = TerminalUI::new(total_secs);
     ui.display_banner(&config, duration_secs);
 
     // Setup graceful shutdown: SIGINT and SIGTERM share one cancellation path.
@@ -171,7 +181,7 @@ async fn main() -> Result<()> {
             let live_metrics = metrics_clone.get_live_metrics();
             ui.update_progress(elapsed, &live_metrics);
 
-            if elapsed >= duration_secs {
+            if elapsed >= total_secs {
                 break;
             }
         }
@@ -204,7 +214,7 @@ async fn main() -> Result<()> {
     let assertion_failures = config.evaluate_assertions(&summary);
 
     // Display summary in terminal
-    let ui = TerminalUI::new(duration_secs);
+    let ui = TerminalUI::new(total_secs);
     if cancellation.is_cancelled() {
         ui.display_warning("Load test cancelled early; reporting completed requests only");
     }

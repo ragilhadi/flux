@@ -22,6 +22,17 @@ pub struct MetricsCollector {
     results: Arc<Mutex<Vec<RequestResult>>>,
     histogram: Arc<Mutex<Histogram<u64>>>,
     start_time: DateTime<Utc>,
+    load_phase: Arc<Mutex<LoadPhase>>,
+}
+
+/// Tracks when the full-concurrency phase began and how much work it did.
+///
+/// Everything before `started_at` was produced while workers were still being
+/// started (ramp-up), so it is reported separately from the measured load.
+#[derive(Debug, Default)]
+struct LoadPhase {
+    started_at: Option<DateTime<Utc>>,
+    requests: usize,
 }
 
 /// Summary statistics
@@ -30,7 +41,15 @@ pub struct MetricsSummary {
     pub total_requests: usize,
     pub successful_requests: usize,
     pub failed_requests: usize,
+    /// Wall-clock time of the whole run, including ramp-up.
     pub total_duration_secs: f64,
+    /// Time spent starting workers before the measured load began.
+    pub ramp_up_secs: f64,
+    /// Measured load window: the run at full concurrency, excluding ramp-up.
+    pub measured_duration_secs: f64,
+    /// Requests issued during the measured load window.
+    pub measured_requests: usize,
+    /// Throughput over the measured load window (ramp-up excluded).
     pub throughput_rps: f64,
     pub min_latency_ms: u64,
     pub max_latency_ms: u64,
@@ -80,12 +99,30 @@ impl MetricsCollector {
                 Histogram::<u64>::new_with_bounds(1, 300_000, 3).unwrap(),
             )),
             start_time: Utc::now(),
+            load_phase: Arc::new(Mutex::new(LoadPhase::default())),
+        }
+    }
+
+    /// Mark the end of ramp-up: every worker has started and the measured
+    /// load window begins now. Repeated calls keep the first mark.
+    pub fn mark_load_phase_started(&self) {
+        if let Ok(mut load_phase) = self.load_phase.lock() {
+            load_phase.started_at.get_or_insert_with(Utc::now);
         }
     }
 
     /// Record a request result
     pub fn record(&self, result: RequestResult) {
         let latency = result.latency_ms;
+
+        if let Ok(mut load_phase) = self.load_phase.lock() {
+            if load_phase
+                .started_at
+                .is_some_and(|started| result.request_start_timestamp >= started)
+            {
+                load_phase.requests += 1;
+            }
+        }
 
         // Store result
         if let Ok(mut results) = self.results.lock() {
@@ -160,8 +197,30 @@ impl MetricsCollector {
             .num_milliseconds() as f64
             / 1000.0;
 
-        let throughput = if duration > 0.0 {
-            total as f64 / duration
+        // Ramp-up is warm-up time, so throughput is reported over the window in
+        // which every worker was running.
+        let (load_started_at, measured_requests) = match self.load_phase.lock() {
+            Ok(load_phase) => (load_phase.started_at, load_phase.requests),
+            Err(_) => (None, total),
+        };
+        let ramp_up_secs = load_started_at
+            .map(|started| {
+                started
+                    .signed_duration_since(self.start_time)
+                    .num_milliseconds() as f64
+                    / 1000.0
+            })
+            .unwrap_or(0.0)
+            .max(0.0);
+        let measured_duration = (duration - ramp_up_secs).max(0.0);
+        let (measured_requests, measured_duration) = if load_started_at.is_some() {
+            (measured_requests, measured_duration)
+        } else {
+            (total, duration)
+        };
+
+        let throughput = if measured_duration > 0.0 {
+            measured_requests as f64 / measured_duration
         } else {
             0.0
         };
@@ -188,7 +247,7 @@ impl MetricsCollector {
         }
         let per_scenario = grouped
             .into_iter()
-            .map(|(name, results)| (name, summarize_scenario(&results, duration)))
+            .map(|(name, results)| (name, summarize_scenario(&results, measured_duration)))
             .collect();
 
         MetricsSummary {
@@ -196,6 +255,9 @@ impl MetricsCollector {
             successful_requests: successful,
             failed_requests: failed,
             total_duration_secs: duration,
+            ramp_up_secs,
+            measured_duration_secs: measured_duration,
+            measured_requests,
             throughput_rps: throughput,
             min_latency_ms: min,
             max_latency_ms: max,

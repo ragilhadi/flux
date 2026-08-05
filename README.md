@@ -230,7 +230,7 @@ output:
 | `concurrency` | integer | No | 10 | Number of concurrent workers |
 | `duration` | string | No | 30s | Test duration (e.g., "30s", "5m", "1h") |
 | `timeout` | string | No | 30s | Per-request timeout (e.g., "5s", "2m") |
-| `ramp_up` | string | No | - | Spread worker startup over this duration |
+| `ramp_up` | string | No | - | Warm-up: spread worker startup over this duration, *before* `duration` starts |
 | `think_time` | string | No | - | Pause after each simple-mode request |
 | `retry_count` | integer | No | 0 | Retry attempts after the initial request |
 | `retry_delay` | string | No | 0s | Pause between retry attempts |
@@ -319,6 +319,31 @@ flux --config ./load-test.yaml --concurrency 50 --duration 60s \
 Run `flux --help` for the complete flag reference.
 
 ---
+
+## ⏱️ Duration and Ramp-up
+
+`duration` is the measured load window and it starts once every worker is
+running. `ramp_up` is warm-up time added *in front* of it, so a run takes
+about `ramp_up + duration` in total:
+
+```yaml
+concurrency: 10
+ramp_up: "10s"     # a worker starts every second
+duration: "10s"    # each worker then has its own full 10 seconds
+```
+
+The run above takes roughly 19 seconds of wall clock (nine one-second gaps plus
+the ten-second window). Every worker gets a full-length active period no matter
+when it started — previously the last workers could be started with no time
+left and never send a single request.
+
+Because ramp-up is warm-up, `ramp_up` may be longer than `duration`, and the
+reports separate the two:
+
+- `total_duration_secs` — wall clock for the whole run, ramp-up included;
+- `ramp_up_secs` — time spent starting workers;
+- `measured_duration_secs` / `measured_requests` — the full-concurrency window;
+- `throughput_rps` — requests per second over the measured window only.
 
 ## 🛑 Stopping a Test Early
 
