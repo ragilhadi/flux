@@ -23,6 +23,7 @@ pub struct MetricsCollector {
     histogram: Arc<Mutex<Histogram<u64>>>,
     start_time: DateTime<Utc>,
     load_phase: Arc<Mutex<LoadPhase>>,
+    skipped_scenarios: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 /// Tracks when the full-concurrency phase began and how much work it did.
@@ -62,6 +63,11 @@ pub struct MetricsSummary {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub per_scenario: BTreeMap<String, ScenarioMetricsSummary>,
+    /// Scenario steps skipped at runtime because a dependency failed, and how
+    /// often. Configuration mistakes never reach this map: they fail the run
+    /// before any request is sent.
+    #[serde(default)]
+    pub skipped_scenarios: BTreeMap<String, usize>,
 }
 
 /// Summary statistics for one named scenario step.
@@ -100,6 +106,15 @@ impl MetricsCollector {
             )),
             start_time: Utc::now(),
             load_phase: Arc::new(Mutex::new(LoadPhase::default())),
+            skipped_scenarios: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Record a scenario step that was skipped because the step it depends on
+    /// failed during this iteration.
+    pub fn record_skipped_scenario(&self, name: &str) {
+        if let Ok(mut skipped) = self.skipped_scenarios.lock() {
+            *skipped.entry(name.to_string()).or_default() += 1;
         }
     }
 
@@ -270,6 +285,11 @@ impl MetricsCollector {
             start_time: self.start_time,
             end_time,
             per_scenario,
+            skipped_scenarios: self
+                .skipped_scenarios
+                .lock()
+                .map(|skipped| skipped.clone())
+                .unwrap_or_default(),
         }
     }
 

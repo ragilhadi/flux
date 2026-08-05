@@ -210,6 +210,30 @@
                 {% endif %}
             </div>
 
+            {% if summary.skipped_scenarios | length > 0 %}
+            <!-- Skipped Steps -->
+            <div class="chart-section">
+                <h2>Skipped Steps</h2>
+                <p>These steps were skipped because the step they depend on failed at runtime.</p>
+                <table class="percentiles-table">
+                    <thead>
+                        <tr>
+                            <th>Scenario</th>
+                            <th>Times Skipped</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for name, count in summary.skipped_scenarios %}
+                        <tr>
+                            <td>{{ name }}</td>
+                            <td class="error">{{ count }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+
             {% if summary.per_scenario | length > 0 %}
             <!-- Per-Scenario Metrics -->
             <div class="chart-section">

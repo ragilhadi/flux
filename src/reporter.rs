@@ -218,6 +218,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: Default::default(),
+            skipped_scenarios: Default::default(),
         };
 
         let reporter = Reporter::new(summary, results);
@@ -258,6 +259,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: Default::default(),
+            skipped_scenarios: Default::default(),
         };
         let reporter = Reporter::new(summary, vec![result]);
         let path = std::env::temp_dir().join(format!(
@@ -310,6 +312,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: std::collections::BTreeMap::from([("login".to_string(), scenario)]),
+            skipped_scenarios: Default::default(),
         };
         let reporter = Reporter::new(summary, Vec::new());
 

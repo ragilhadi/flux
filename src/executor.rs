@@ -214,11 +214,15 @@ impl Executor {
 
             // Check dependencies
             if let Some(ref depends_on) = scenario.depends_on {
+                // Configuration validation guarantees the dependency exists and
+                // runs earlier, so reaching this point means it failed at
+                // runtime. Count the skip so reports show the lost work.
                 if !Self::has_executed_scenario(depends_on, &executed) {
                     warn!(
-                        "Skipping scenario '{}' - dependency '{}' not met",
+                        "Skipping scenario '{}' - dependency '{}' did not succeed",
                         scenario.name, depends_on
                     );
+                    self.metrics.record_skipped_scenario(&scenario.name);
                     continue;
                 }
             }
@@ -748,6 +752,56 @@ mod tests {
                 csv: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn test_runtime_dependency_failure_is_counted_as_skipped() {
+        let (address, server) = spawn_status_server(500).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.scenarios = vec![
+            Scenario {
+                name: "login".to_string(),
+                method: "GET".to_string(),
+                url: "/login".to_string(),
+                headers: HashMap::new(),
+                body: None,
+                multipart: None,
+                extract: HashMap::new(),
+                depends_on: None,
+                think_time: None,
+                retry_count: None,
+                retry_delay: None,
+                retry_on_status: None,
+                assertions: None,
+            },
+            Scenario {
+                name: "profile".to_string(),
+                method: "GET".to_string(),
+                url: "/profile".to_string(),
+                headers: HashMap::new(),
+                body: None,
+                multipart: None,
+                extract: HashMap::new(),
+                depends_on: Some("login".to_string()),
+                think_time: None,
+                retry_count: None,
+                retry_delay: None,
+                retry_on_status: None,
+                assertions: None,
+            },
+        ];
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        executor.execute_scenarios().await;
+        server.abort();
+
+        let summary = metrics.generate_summary();
+        // The dependency failed at runtime, so the dependent step is skipped
+        // and the skip is visible in the report instead of vanishing.
+        assert_eq!(summary.skipped_scenarios.get("profile"), Some(&1));
+        assert!(!summary.per_scenario.contains_key("profile"));
+        assert_eq!(summary.failed_requests, 1);
     }
 
     #[tokio::test]

@@ -254,19 +254,39 @@ output:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Step name |
+| `name` | string | Yes | Step name; must be non-empty and unique |
 | `method` | string | Yes | HTTP method |
 | `url` | string | Yes | URL path or full URL |
 | `headers` | map | No | HTTP headers |
 | `body` | string | No | Request body |
 | `multipart` | array | No | Multipart form data |
 | `extract` | map | No | JSONPath extraction rules |
-| `depends_on` | string | No | Name of step this depends on |
+| `depends_on` | string | No | Name of an **earlier** step this depends on |
 | `think_time` | string | No | Pause after this step |
 | `retry_count` | integer | No | Override the global retry count |
 | `retry_delay` | string | No | Override the global retry delay |
 | `retry_on_status` | array | No | Override global retryable statuses |
 | `assert` | object | No | Expected `status_code` and/or `body_contains` value |
+
+### Scenario Dependencies
+
+`depends_on` names another step in the same list. Because scenarios execute in
+declaration order, the referenced step must be declared **before** the step that
+uses it. Flux checks the whole scenario graph while loading the configuration
+and refuses to start when it finds:
+
+- an empty or duplicated scenario name;
+- a `depends_on` value naming a scenario that does not exist (a typo);
+- a step that depends on itself;
+- a step that depends on a later step — which also rules out dependency cycles.
+
+These are configuration mistakes, so they fail before a single request is sent
+instead of silently turning a user journey into a partial load test.
+
+At runtime a dependency can still fail — a bad response, a failed assertion, a
+network error. The dependent step is then skipped for that iteration, and the
+skip is counted per step in the terminal summary, the JSON report
+(`summary.skipped_scenarios`) and the HTML report.
 
 ### Quality Gates
 
