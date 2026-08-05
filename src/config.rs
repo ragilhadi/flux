@@ -185,6 +185,14 @@ pub struct OutputConfig {
     /// Optional CSV output file path
     #[serde(default)]
     pub csv: Option<String>,
+
+    /// Maximum per-request rows kept in memory for the JSON/HTML reports.
+    ///
+    /// Aggregate statistics always cover every request; this only bounds the
+    /// raw rows so a long or high-throughput run cannot exhaust memory. Set to
+    /// `0` to retain everything.
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
 }
 
 fn default_concurrency() -> usize {
@@ -201,6 +209,10 @@ fn default_timeout() -> String {
 
 fn default_mode() -> String {
     "async".to_string()
+}
+
+fn default_max_results() -> usize {
+    crate::metrics::DEFAULT_MAX_STORED_RESULTS
 }
 
 impl Config {
@@ -666,6 +678,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::DEFAULT_MAX_STORED_RESULTS;
 
     #[test]
     fn test_parse_duration() {
@@ -691,6 +704,7 @@ mod tests {
                 json: "/app/results/output.json".to_string(),
                 html: "/app/results/output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
 
@@ -733,6 +747,7 @@ mod tests {
                 json: "out.json".to_string(),
                 html: "out.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
         assert_eq!(config.parse_timeout().unwrap(), Duration::from_millis(250));
@@ -778,6 +793,7 @@ mod tests {
                 json: "original.json".to_string(),
                 html: "original.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
 
@@ -822,6 +838,7 @@ mod tests {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
 
@@ -887,8 +904,31 @@ mod tests {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         }
+    }
+
+    #[test]
+    fn test_max_results_defaults_to_a_bounded_value() {
+        let yaml = r#"
+target: "http://example.com"
+output:
+  json: "output.json"
+  html: "output.html"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.output.max_results, DEFAULT_MAX_STORED_RESULTS);
+
+        let unlimited = r#"
+target: "http://example.com"
+output:
+  json: "output.json"
+  html: "output.html"
+  max_results: 0
+"#;
+        let config: Config = serde_yaml::from_str(unlimited).unwrap();
+        assert_eq!(config.output.max_results, 0);
     }
 
     #[test]
@@ -1006,6 +1046,7 @@ mod tests {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
+                max_results: 0,
             },
         };
         let summary = MetricsSummary {
@@ -1029,6 +1070,8 @@ mod tests {
             end_time: chrono::Utc::now(),
             per_scenario: Default::default(),
             skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
         };
 
         let failures = config.evaluate_assertions(&summary);

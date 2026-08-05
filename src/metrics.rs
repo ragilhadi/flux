@@ -3,7 +3,18 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
+
+/// Upper bound of the latency histogram, in milliseconds.
+const HISTOGRAM_MAX_MS: u64 = 300_000;
+
+/// Default number of raw request results kept in memory for reporting.
+///
+/// Aggregates are computed as results arrive, so this only caps the per-request
+/// rows embedded in the JSON/HTML reports. It keeps a long or high-throughput
+/// run from growing without bound and exhausting the container.
+pub const DEFAULT_MAX_STORED_RESULTS: usize = 10_000;
 
 /// Single request result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,13 +28,44 @@ pub struct RequestResult {
 }
 
 /// Metrics collector for aggregating results
+///
+/// Aggregates (counters, histograms, per-scenario statistics) are updated on
+/// every result and are therefore independent of how many raw results are
+/// retained. Raw results are kept only for report rows and are capped by
+/// `max_stored_results`.
 #[derive(Debug)]
 pub struct MetricsCollector {
-    results: Arc<Mutex<Vec<RequestResult>>>,
-    histogram: Arc<Mutex<Histogram<u64>>>,
+    state: Arc<Mutex<CollectorState>>,
     start_time: DateTime<Utc>,
-    load_phase: Arc<Mutex<LoadPhase>>,
-    skipped_scenarios: Arc<Mutex<BTreeMap<String, usize>>>,
+    max_stored_results: usize,
+}
+
+/// Everything guarded by a single lock, so recording a result takes one
+/// uncontended critical section rather than several.
+#[derive(Debug)]
+struct CollectorState {
+    /// Bounded sample of raw results, used for report rows.
+    results: Vec<RequestResult>,
+    /// Results not retained because the cap was reached.
+    dropped_results: usize,
+    aggregate: Aggregate,
+    per_scenario: BTreeMap<String, Aggregate>,
+    load_phase: LoadPhase,
+    skipped_scenarios: BTreeMap<String, usize>,
+    /// Streaming sink for raw rows, dropped by `close_result_stream` so the
+    /// writer task can finish.
+    csv_sink: Option<UnboundedSender<RequestResult>>,
+}
+
+/// Streaming statistics for a set of requests.
+#[derive(Debug)]
+struct Aggregate {
+    total: usize,
+    failed: usize,
+    latency_sum: u128,
+    min_latency_ms: u64,
+    max_latency_ms: u64,
+    histogram: Histogram<u64>,
 }
 
 /// Tracks when the full-concurrency phase began and how much work it did.
@@ -68,6 +110,13 @@ pub struct MetricsSummary {
     /// before any request is sent.
     #[serde(default)]
     pub skipped_scenarios: BTreeMap<String, usize>,
+    /// Raw per-request rows kept for the reports.
+    #[serde(default)]
+    pub retained_results: usize,
+    /// Raw per-request rows discarded once the retention cap was reached. The
+    /// statistics above still cover every request.
+    #[serde(default)]
+    pub dropped_results: usize,
 }
 
 /// Summary statistics for one named scenario step.
@@ -96,73 +145,188 @@ pub struct LiveMetrics {
     pub total_requests: usize,
 }
 
-impl MetricsCollector {
-    /// Create a new metrics collector
-    pub fn new() -> Self {
+impl Aggregate {
+    fn new() -> Self {
         Self {
-            results: Arc::new(Mutex::new(Vec::new())),
-            histogram: Arc::new(Mutex::new(
-                Histogram::<u64>::new_with_bounds(1, 300_000, 3).unwrap(),
-            )),
+            total: 0,
+            failed: 0,
+            latency_sum: 0,
+            min_latency_ms: u64::MAX,
+            max_latency_ms: 0,
+            histogram: Histogram::<u64>::new_with_bounds(1, HISTOGRAM_MAX_MS, 3)
+                .expect("valid histogram bounds"),
+        }
+    }
+
+    fn observe(&mut self, result: &RequestResult) {
+        let latency = result.latency_ms;
+
+        self.total += 1;
+        if result.error.is_some() {
+            self.failed += 1;
+        }
+        self.latency_sum += latency as u128;
+        self.min_latency_ms = self.min_latency_ms.min(latency);
+        self.max_latency_ms = self.max_latency_ms.max(latency);
+
+        let clamped = latency.min(HISTOGRAM_MAX_MS);
+        if clamped < latency {
+            warn!(
+                "Latency {}ms exceeds histogram maximum; clamping to {}ms",
+                latency, clamped
+            );
+        }
+        if let Err(e) = self.histogram.record(clamped) {
+            warn!("Histogram record error for latency {}ms: {}", clamped, e);
+        }
+    }
+
+    fn mean_latency_ms(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.latency_sum as f64 / self.total as f64
+        }
+    }
+
+    fn min(&self) -> u64 {
+        if self.total == 0 {
+            0
+        } else {
+            self.min_latency_ms
+        }
+    }
+
+    fn error_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.failed as f64 / self.total as f64) * 100.0
+        }
+    }
+
+    fn summarize_scenario(&self, duration: f64) -> ScenarioMetricsSummary {
+        ScenarioMetricsSummary {
+            total_requests: self.total,
+            successful_requests: self.total - self.failed,
+            failed_requests: self.failed,
+            throughput_rps: if duration > 0.0 {
+                self.total as f64 / duration
+            } else {
+                0.0
+            },
+            min_latency_ms: self.min(),
+            max_latency_ms: self.max_latency_ms,
+            mean_latency_ms: self.mean_latency_ms(),
+            p50_latency_ms: self.histogram.value_at_quantile(0.50),
+            p90_latency_ms: self.histogram.value_at_quantile(0.90),
+            p95_latency_ms: self.histogram.value_at_quantile(0.95),
+            p99_latency_ms: self.histogram.value_at_quantile(0.99),
+            error_rate: self.error_rate(),
+        }
+    }
+}
+
+impl MetricsCollector {
+    /// Create a collector that retains every raw result.
+    pub fn new() -> Self {
+        Self::with_retention(0, None)
+    }
+
+    /// Create a collector that retains at most `max_stored_results` raw
+    /// results (`0` retains everything) and optionally forwards every result
+    /// to a streaming sink, such as the CSV writer.
+    pub fn with_retention(
+        max_stored_results: usize,
+        csv_sink: Option<UnboundedSender<RequestResult>>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CollectorState {
+                results: Vec::new(),
+                dropped_results: 0,
+                aggregate: Aggregate::new(),
+                per_scenario: BTreeMap::new(),
+                load_phase: LoadPhase::default(),
+                skipped_scenarios: BTreeMap::new(),
+                csv_sink,
+            })),
             start_time: Utc::now(),
-            load_phase: Arc::new(Mutex::new(LoadPhase::default())),
-            skipped_scenarios: Arc::new(Mutex::new(BTreeMap::new())),
+            max_stored_results,
+        }
+    }
+
+    /// Stop forwarding results to the streaming sink.
+    ///
+    /// The collector holds the last sender, so the writer task only sees the
+    /// channel close — and can flush and finish — once this is called.
+    pub fn close_result_stream(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.csv_sink = None;
         }
     }
 
     /// Record a scenario step that was skipped because the step it depends on
     /// failed during this iteration.
     pub fn record_skipped_scenario(&self, name: &str) {
-        if let Ok(mut skipped) = self.skipped_scenarios.lock() {
-            *skipped.entry(name.to_string()).or_default() += 1;
+        if let Ok(mut state) = self.state.lock() {
+            *state.skipped_scenarios.entry(name.to_string()).or_default() += 1;
         }
     }
 
     /// Mark the end of ramp-up: every worker has started and the measured
     /// load window begins now. Repeated calls keep the first mark.
     pub fn mark_load_phase_started(&self) {
-        if let Ok(mut load_phase) = self.load_phase.lock() {
-            load_phase.started_at.get_or_insert_with(Utc::now);
+        if let Ok(mut state) = self.state.lock() {
+            state.load_phase.started_at.get_or_insert_with(Utc::now);
         }
     }
 
     /// Record a request result
     pub fn record(&self, result: RequestResult) {
-        let latency = result.latency_ms;
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
 
-        if let Ok(mut load_phase) = self.load_phase.lock() {
-            if load_phase
-                .started_at
-                .is_some_and(|started| result.request_start_timestamp >= started)
-            {
-                load_phase.requests += 1;
-            }
+        // Streamed output receives every row, including rows that are not
+        // retained in memory.
+        if let Some(sink) = &state.csv_sink {
+            let _ = sink.send(result.clone());
         }
 
-        // Store result
-        if let Ok(mut results) = self.results.lock() {
-            results.push(result);
+        state.aggregate.observe(&result);
+        if let Some(name) = &result.scenario_name {
+            state
+                .per_scenario
+                .entry(name.clone())
+                .or_insert_with(Aggregate::new)
+                .observe(&result);
+        }
+        if state
+            .load_phase
+            .started_at
+            .is_some_and(|started| result.request_start_timestamp >= started)
+        {
+            state.load_phase.requests += 1;
         }
 
-        // Update histogram
-        if let Ok(mut hist) = self.histogram.lock() {
-            let clamped = latency.min(300_000);
-            if clamped < latency {
-                warn!(
-                    "Latency {}ms exceeds histogram maximum; clamping to {}ms",
-                    latency, clamped
-                );
-            }
-            if let Err(e) = hist.record(clamped) {
-                warn!("Histogram record error for latency {}ms: {}", clamped, e);
-            }
+        if self.max_stored_results == 0 || state.results.len() < self.max_stored_results {
+            state.results.push(result);
+        } else {
+            state.dropped_results += 1;
         }
     }
 
     /// Get current live metrics
     pub fn get_live_metrics(&self) -> LiveMetrics {
-        let results = self.results.lock().unwrap();
-        let total = results.len();
+        let Ok(state) = self.state.lock() else {
+            return LiveMetrics {
+                current_rps: 0.0,
+                avg_latency_ms: 0.0,
+                error_count: 0,
+                total_requests: 0,
+            };
+        };
+        let total = state.aggregate.total;
 
         if total == 0 {
             return LiveMetrics {
@@ -173,16 +337,7 @@ impl MetricsCollector {
             };
         }
 
-        let elapsed = Utc::now()
-            .signed_duration_since(self.start_time)
-            .num_milliseconds() as f64
-            / 1000.0;
-
-        let error_count = results.iter().filter(|r| r.error.is_some()).count();
-
-        let sum_latency: u64 = results.iter().map(|r| r.latency_ms).sum();
-        let avg_latency = sum_latency as f64 / total as f64;
-
+        let elapsed = self.elapsed_secs();
         let current_rps = if elapsed > 0.0 {
             total as f64 / elapsed
         } else {
@@ -191,33 +346,26 @@ impl MetricsCollector {
 
         LiveMetrics {
             current_rps,
-            avg_latency_ms: avg_latency,
-            error_count,
+            avg_latency_ms: state.aggregate.mean_latency_ms(),
+            error_count: state.aggregate.failed,
             total_requests: total,
         }
     }
 
     /// Generate final summary
     pub fn generate_summary(&self) -> MetricsSummary {
-        let results = self.results.lock().unwrap();
-        let histogram = self.histogram.lock().unwrap();
+        let state = self.state.lock().expect("metrics state poisoned");
 
-        let total = results.len();
-        let successful = results.iter().filter(|r| r.error.is_none()).count();
-        let failed = total - successful;
+        let total = state.aggregate.total;
+        let failed = state.aggregate.failed;
+        let successful = total - failed;
 
         let end_time = Utc::now();
-        let duration = end_time
-            .signed_duration_since(self.start_time)
-            .num_milliseconds() as f64
-            / 1000.0;
+        let duration = self.elapsed_secs();
 
         // Ramp-up is warm-up time, so throughput is reported over the window in
         // which every worker was running.
-        let (load_started_at, measured_requests) = match self.load_phase.lock() {
-            Ok(load_phase) => (load_phase.started_at, load_phase.requests),
-            Err(_) => (None, total),
-        };
+        let load_started_at = state.load_phase.started_at;
         let ramp_up_secs = load_started_at
             .map(|started| {
                 started
@@ -227,9 +375,11 @@ impl MetricsCollector {
             })
             .unwrap_or(0.0)
             .max(0.0);
-        let measured_duration = (duration - ramp_up_secs).max(0.0);
         let (measured_requests, measured_duration) = if load_started_at.is_some() {
-            (measured_requests, measured_duration)
+            (
+                state.load_phase.requests,
+                (duration - ramp_up_secs).max(0.0),
+            )
         } else {
             (total, duration)
         };
@@ -240,29 +390,15 @@ impl MetricsCollector {
             0.0
         };
 
-        let error_rate = if total > 0 {
-            (failed as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let min = histogram.min();
-        let max = histogram.max();
-        let mean = histogram.mean();
-        let p50 = histogram.value_at_quantile(0.50);
-        let p90 = histogram.value_at_quantile(0.90);
-        let p95 = histogram.value_at_quantile(0.95);
-        let p99 = histogram.value_at_quantile(0.99);
-
-        let mut grouped: BTreeMap<String, Vec<&RequestResult>> = BTreeMap::new();
-        for result in results.iter() {
-            if let Some(name) = &result.scenario_name {
-                grouped.entry(name.clone()).or_default().push(result);
-            }
-        }
-        let per_scenario = grouped
-            .into_iter()
-            .map(|(name, results)| (name, summarize_scenario(&results, measured_duration)))
+        let per_scenario = state
+            .per_scenario
+            .iter()
+            .map(|(name, aggregate)| {
+                (
+                    name.clone(),
+                    aggregate.summarize_scenario(measured_duration),
+                )
+            })
             .collect();
 
         MetricsSummary {
@@ -274,44 +410,43 @@ impl MetricsCollector {
             measured_duration_secs: measured_duration,
             measured_requests,
             throughput_rps: throughput,
-            min_latency_ms: min,
-            max_latency_ms: max,
-            mean_latency_ms: mean,
-            p50_latency_ms: p50,
-            p90_latency_ms: p90,
-            p95_latency_ms: p95,
-            p99_latency_ms: p99,
-            error_rate,
+            min_latency_ms: state.aggregate.min(),
+            max_latency_ms: state.aggregate.max_latency_ms,
+            mean_latency_ms: state.aggregate.mean_latency_ms(),
+            p50_latency_ms: state.aggregate.histogram.value_at_quantile(0.50),
+            p90_latency_ms: state.aggregate.histogram.value_at_quantile(0.90),
+            p95_latency_ms: state.aggregate.histogram.value_at_quantile(0.95),
+            p99_latency_ms: state.aggregate.histogram.value_at_quantile(0.99),
+            error_rate: state.aggregate.error_rate(),
             start_time: self.start_time,
             end_time,
             per_scenario,
-            skipped_scenarios: self
-                .skipped_scenarios
-                .lock()
-                .map(|skipped| skipped.clone())
-                .unwrap_or_default(),
+            skipped_scenarios: state.skipped_scenarios.clone(),
+            retained_results: state.results.len(),
+            dropped_results: state.dropped_results,
         }
     }
 
-    /// Get all results for reporting
+    /// Get the retained results for reporting.
+    ///
+    /// This is a bounded sample when a retention cap is configured; the summary
+    /// reports how many rows were retained and dropped.
     pub fn get_results(&self) -> Vec<RequestResult> {
-        self.results.lock().unwrap().clone()
+        self.state
+            .lock()
+            .map(|state| state.results.clone())
+            .unwrap_or_default()
     }
 
     /// Render a current Prometheus text-format snapshot.
     pub fn render_prometheus(&self) -> String {
-        let results = self.results.lock().unwrap();
-        let histogram = self.histogram.lock().unwrap();
-        let total = results.len();
-        let failed = results
-            .iter()
-            .filter(|result| result.error.is_some())
-            .count();
+        let Ok(state) = self.state.lock() else {
+            return String::new();
+        };
+        let total = state.aggregate.total;
+        let failed = state.aggregate.failed;
         let successful = total - failed;
-        let elapsed = Utc::now()
-            .signed_duration_since(self.start_time)
-            .num_milliseconds() as f64
-            / 1000.0;
+        let elapsed = self.elapsed_secs();
         let rps = if elapsed > 0.0 {
             total as f64 / elapsed
         } else {
@@ -336,51 +471,20 @@ impl MetricsCollector {
             ),
             successful,
             failed,
-            histogram.value_at_quantile(0.50),
-            histogram.value_at_quantile(0.90),
-            histogram.value_at_quantile(0.95),
-            histogram.value_at_quantile(0.99),
+            state.aggregate.histogram.value_at_quantile(0.50),
+            state.aggregate.histogram.value_at_quantile(0.90),
+            state.aggregate.histogram.value_at_quantile(0.95),
+            state.aggregate.histogram.value_at_quantile(0.99),
             rps
         )
     }
-}
 
-fn summarize_scenario(results: &[&RequestResult], duration: f64) -> ScenarioMetricsSummary {
-    let total = results.len();
-    let successful = results
-        .iter()
-        .filter(|result| result.error.is_none())
-        .count();
-    let failed = total - successful;
-    let mut latencies: Vec<u64> = results.iter().map(|result| result.latency_ms).collect();
-    latencies.sort_unstable();
-    let mean = latencies.iter().sum::<u64>() as f64 / total as f64;
-
-    ScenarioMetricsSummary {
-        total_requests: total,
-        successful_requests: successful,
-        failed_requests: failed,
-        throughput_rps: if duration > 0.0 {
-            total as f64 / duration
-        } else {
-            0.0
-        },
-        min_latency_ms: latencies[0],
-        max_latency_ms: latencies[total - 1],
-        mean_latency_ms: mean,
-        p50_latency_ms: percentile(&latencies, 0.50),
-        p90_latency_ms: percentile(&latencies, 0.90),
-        p95_latency_ms: percentile(&latencies, 0.95),
-        p99_latency_ms: percentile(&latencies, 0.99),
-        error_rate: (failed as f64 / total as f64) * 100.0,
+    fn elapsed_secs(&self) -> f64 {
+        Utc::now()
+            .signed_duration_since(self.start_time)
+            .num_milliseconds() as f64
+            / 1000.0
     }
-}
-
-fn percentile(sorted_values: &[u64], quantile: f64) -> u64 {
-    let index = ((sorted_values.len() as f64 * quantile).ceil() as usize)
-        .saturating_sub(1)
-        .min(sorted_values.len() - 1);
-    sorted_values[index]
 }
 
 impl Default for MetricsCollector {
@@ -393,20 +497,22 @@ impl Default for MetricsCollector {
 mod tests {
     use super::*;
 
+    fn result(scenario: Option<&str>, latency_ms: u64, error: Option<&str>) -> RequestResult {
+        RequestResult {
+            scenario_name: scenario.map(ToString::to_string),
+            latency_ms,
+            status_code: if error.is_some() { 500 } else { 200 },
+            error: error.map(ToString::to_string),
+            request_start_timestamp: Utc::now(),
+            request_end_timestamp: Utc::now(),
+        }
+    }
+
     #[test]
     fn test_metrics_collector() {
         let collector = MetricsCollector::new();
 
-        let result = RequestResult {
-            scenario_name: Some("test".to_string()),
-            latency_ms: 100,
-            status_code: 200,
-            error: None,
-            request_start_timestamp: Utc::now(),
-            request_end_timestamp: Utc::now(),
-        };
-
-        collector.record(result.clone());
+        collector.record(result(Some("test"), 100, None));
 
         let live = collector.get_live_metrics();
         assert_eq!(live.total_requests, 1);
@@ -426,16 +532,7 @@ mod tests {
     fn test_metrics_error_status_counted_as_failure() {
         let collector = MetricsCollector::new();
 
-        let result = RequestResult {
-            scenario_name: None,
-            latency_ms: 50,
-            status_code: 500,
-            error: Some("HTTP 500".to_string()),
-            request_start_timestamp: Utc::now(),
-            request_end_timestamp: Utc::now(),
-        };
-
-        collector.record(result);
+        collector.record(result(None, 50, Some("HTTP 500")));
 
         let summary = collector.generate_summary();
         assert_eq!(summary.failed_requests, 1);
@@ -448,19 +545,133 @@ mod tests {
         let collector = MetricsCollector::new();
 
         // Record a latency larger than the histogram max (300_000 ms)
-        let result = RequestResult {
-            scenario_name: None,
-            latency_ms: 400_000,
-            status_code: 200,
-            error: None,
-            request_start_timestamp: Utc::now(),
-            request_end_timestamp: Utc::now(),
-        };
-
-        // Should not panic; large latency is clamped
-        collector.record(result);
+        collector.record(result(None, 400_000, None));
 
         let summary = collector.generate_summary();
         assert_eq!(summary.total_requests, 1);
+    }
+
+    #[test]
+    fn test_retention_cap_bounds_memory_without_losing_statistics() {
+        let collector = MetricsCollector::with_retention(10, None);
+
+        for index in 0..1_000_u64 {
+            let error = (index % 10 == 0).then_some("HTTP 500");
+            collector.record(result(Some("step"), index + 1, error));
+        }
+
+        let summary = collector.generate_summary();
+
+        // Only the cap is retained, but every request is still counted.
+        assert_eq!(summary.retained_results, 10);
+        assert_eq!(summary.dropped_results, 990);
+        assert_eq!(collector.get_results().len(), 10);
+        assert_eq!(summary.total_requests, 1_000);
+        assert_eq!(summary.failed_requests, 100);
+        assert_eq!(summary.successful_requests, 900);
+        assert_eq!(summary.error_rate, 10.0);
+        assert_eq!(summary.min_latency_ms, 1);
+        assert_eq!(summary.max_latency_ms, 1_000);
+        assert_eq!(summary.mean_latency_ms, 500.5);
+
+        // Percentiles come from the histogram, which sees every request.
+        assert!((490..=510).contains(&summary.p50_latency_ms));
+        assert!((940..=960).contains(&summary.p95_latency_ms));
+
+        let scenario = summary.per_scenario.get("step").unwrap();
+        assert_eq!(scenario.total_requests, 1_000);
+        assert_eq!(scenario.failed_requests, 100);
+        assert_eq!(scenario.min_latency_ms, 1);
+        assert_eq!(scenario.max_latency_ms, 1_000);
+        assert_eq!(scenario.mean_latency_ms, 500.5);
+    }
+
+    #[test]
+    fn test_unlimited_retention_keeps_every_result() {
+        let collector = MetricsCollector::new();
+
+        for index in 0..100 {
+            collector.record(result(None, index + 1, None));
+        }
+
+        let summary = collector.generate_summary();
+        assert_eq!(summary.retained_results, 100);
+        assert_eq!(summary.dropped_results, 0);
+        assert_eq!(collector.get_results().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_results_are_forwarded_to_the_streaming_sink() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let collector = MetricsCollector::with_retention(1, Some(sender));
+
+        for index in 0..5 {
+            collector.record(result(Some("step"), index + 1, None));
+        }
+        drop(collector);
+
+        let mut streamed = Vec::new();
+        while let Some(result) = receiver.recv().await {
+            streamed.push(result);
+        }
+
+        // Every row reaches the stream even though only one is retained.
+        assert_eq!(streamed.len(), 5);
+        assert_eq!(streamed[4].latency_ms, 5);
+    }
+
+    #[tokio::test]
+    async fn test_closing_the_stream_ends_it_while_the_collector_is_alive() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let collector = MetricsCollector::with_retention(0, Some(sender));
+
+        collector.record(result(None, 10, None));
+        collector.record(result(None, 20, None));
+        collector.close_result_stream();
+        // Recording after the stream is closed still updates the statistics.
+        collector.record(result(None, 30, None));
+
+        let mut streamed = 0;
+        while receiver.recv().await.is_some() {
+            streamed += 1;
+        }
+
+        // The channel closed even though the collector is still in use, which
+        // is what lets the CSV writer flush and finish.
+        assert_eq!(streamed, 2);
+        assert_eq!(collector.generate_summary().total_requests, 3);
+    }
+
+    #[test]
+    fn test_live_metrics_survive_capped_retention() {
+        let collector = MetricsCollector::with_retention(2, None);
+
+        collector.record(result(None, 100, None));
+        collector.record(result(None, 200, Some("HTTP 500")));
+        collector.record(result(None, 300, None));
+
+        let live = collector.get_live_metrics();
+        assert_eq!(live.total_requests, 3);
+        assert_eq!(live.error_count, 1);
+        assert_eq!(live.avg_latency_ms, 200.0);
+    }
+
+    #[test]
+    fn test_prometheus_snapshot_counts_every_request() {
+        let collector = MetricsCollector::with_retention(1, None);
+
+        collector.record(result(None, 10, None));
+        collector.record(result(None, 20, Some("HTTP 500")));
+        collector.record(result(None, 30, None));
+
+        let rendered = collector.render_prometheus();
+        assert!(
+            rendered.contains("flux_requests_total{status=\"success\"} 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("flux_requests_total{status=\"failure\"} 1"),
+            "{rendered}"
+        );
     }
 }

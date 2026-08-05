@@ -333,7 +333,35 @@ Scenario response assertions are recorded as request failures when the expected 
 
 ### Report Outputs
 
-`output.json` and `output.html` remain required. Set optional `output.csv` to write one row per request with timestamp, scenario, latency, status code, and error details.
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `json` | string | Yes | - | JSON report path |
+| `html` | string | Yes | - | HTML report path |
+| `csv` | string | No | - | Per-request CSV path, streamed to disk while the test runs |
+| `max_results` | integer | No | 10000 | Per-request rows kept in memory for the JSON/HTML reports (`0` keeps all) |
+
+#### Memory Use on Long Runs
+
+Aggregate statistics — totals, error rate, latency percentiles and the
+per-scenario breakdown — are computed as each request completes, so they always
+cover every request and use a fixed amount of memory.
+
+Raw per-request rows are a different matter: they are what the JSON and HTML
+reports embed, and keeping one for every request of a sustained high-throughput
+run (10,000 req/s for an hour is 36 million rows) can exhaust the container and
+invalidate the test. `output.max_results` therefore caps how many rows are kept,
+at 10,000 by default. When the cap is reached:
+
+- the summary reports `retained_results` and `dropped_results`, and both the
+  terminal output and the HTML report say the rows are a sample;
+- totals, error rate, percentiles and per-scenario statistics are unaffected.
+
+Set `max_results: 0` to keep every row, and be explicit about the memory that
+implies.
+
+If you need every request row, use `output.csv`: rows are streamed to the file
+as they are produced, so the CSV is complete regardless of `max_results` and
+without holding the rows in memory.
 
 ### Variable Extraction
 
@@ -432,6 +460,7 @@ Flux collects comprehensive metrics for each request:
 - **Status codes** distribution
 - **Error rate** and error messages
 - **Request timestamps** for timeline analysis
+- **Retention counters** (`retained_results` / `dropped_results`) when raw rows are capped
 
 ---
 

@@ -14,7 +14,7 @@ use config::Config;
 use executor::Executor;
 use metrics::MetricsCollector;
 use prometheus::PrometheusServer;
-use reporter::Reporter;
+use reporter::{CsvResultStream, Reporter};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
 use std::path::PathBuf;
@@ -112,8 +112,24 @@ async fn main() -> Result<()> {
     };
     let total_secs = duration_secs.saturating_add(ramp_up_secs);
 
+    // Per-request CSV rows are streamed to disk as they are produced, so the
+    // full-fidelity export never has to be held in memory.
+    let csv_stream = match &config.output.csv {
+        Some(path) => match CsvResultStream::create(path) {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                eprintln!("Failed to open CSV output {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // Create metrics collector
-    let metrics = Arc::new(MetricsCollector::new());
+    let metrics = Arc::new(MetricsCollector::with_retention(
+        config.output.max_results,
+        csv_stream.as_ref().map(|stream| stream.sender()),
+    ));
 
     // Create terminal UI
     let ui = TerminalUI::new(total_secs);
@@ -236,11 +252,15 @@ async fn main() -> Result<()> {
         ui.display_success(&format!("HTML report saved to: {}", config.output.html));
     }
 
-    if let Some(csv_path) = &config.output.csv {
-        if let Err(e) = reporter.generate_csv(csv_path) {
-            error!("Failed to generate CSV report: {}", e);
-        } else {
-            ui.display_success(&format!("CSV report saved to: {csv_path}"));
+    if let (Some(stream), Some(csv_path)) = (csv_stream, &config.output.csv) {
+        // The collector holds the last sender; release it so the writer task
+        // sees the channel close, flushes and returns.
+        metrics.close_result_stream();
+        match stream.finish().await {
+            Ok(rows) => {
+                ui.display_success(&format!("CSV report saved to: {csv_path} ({rows} rows)"))
+            }
+            Err(e) => error!("Failed to generate CSV report: {}", e),
         }
     }
 

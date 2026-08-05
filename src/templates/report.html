@@ -306,6 +306,18 @@
                 </table>
             </div>
 
+            {% if summary.dropped_results > 0 %}
+            <div class="chart-section">
+                <h2>Retained Results</h2>
+                <p>
+                    The charts below are drawn from {{ summary.retained_results }} of
+                    {{ summary.total_requests }} requests: {{ summary.dropped_results }} per-request
+                    rows were not retained because of the <code>output.max_results</code> cap.
+                    Totals, error rate and percentiles cover every request.
+                </p>
+            </div>
+            {% endif %}
+
             <!-- Latency Distribution Chart -->
             <div class="chart-section">
                 <h2>📈 Latency Distribution</h2>
