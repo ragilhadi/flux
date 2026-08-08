@@ -179,7 +179,7 @@ impl LiveDashboard {
 
     /// Browser-friendly URL for the dashboard.
     pub fn url(&self) -> String {
-        let address = self.local_addr;
+        let address = self.local_addr();
         if address.ip().is_unspecified() {
             format!("http://localhost:{}/", address.port())
         } else {
