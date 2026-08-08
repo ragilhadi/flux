@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Flux – Live Dashboard</title>
+<style>
+  :root {
+    --bg: #0e1117;
+    --panel: #161b23;
+    --border: #262d38;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: 0.5px; }
+  h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .pill {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .pill.running { color: var(--ok); border-color: var(--ok); }
+  .pill.completed { color: var(--accent); border-color: var(--accent); }
+  .pill.cancelled { color: var(--warn); border-color: var(--warn); }
+  .pill.offline { color: var(--bad); border-color: var(--bad); }
+  .spacer { flex: 1; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .card, .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  .card .value { font-size: 24px; margin-top: 6px; }
+  .card .value.bad { color: var(--bad); }
+  .card .value.ok { color: var(--ok); }
+  .panels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: normal; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  td.num, th.num { text-align: right; }
+  .scroll { overflow-x: auto; }
+  .bar { height: 8px; border-radius: 4px; background: var(--accent); min-width: 2px; }
+  .bar.bad { background: var(--bad); }
+  .bar.warn { background: var(--warn); }
+  .empty { color: var(--muted); padding: 8px; }
+  .error-cell { white-space: normal; word-break: break-word; max-width: 420px; color: var(--bad); }
+  svg { width: 100%; height: 120px; display: block; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  code { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Flux live dashboard</h1>
+  <span class="pill" id="status">connecting…</span>
+  <span class="pill" id="elapsed">0s elapsed</span>
+  <span class="spacer"></span>
+  <span class="pill" id="updated">waiting for data…</span>
+</header>
+
+<section class="grid">
+  <div class="card"><div class="label">Requests/sec</div><div class="value" id="rps">–</div></div>
+  <div class="card"><div class="label">Total requests</div><div class="value" id="total">–</div></div>
+  <div class="card"><div class="label">Failed</div><div class="value" id="failed">–</div></div>
+  <div class="card"><div class="label">Error rate</div><div class="value" id="error-rate">–</div></div>
+  <div class="card"><div class="label">Mean latency</div><div class="value" id="mean">–</div></div>
+  <div class="card"><div class="label">p50</div><div class="value" id="p50">–</div></div>
+  <div class="card"><div class="label">p95</div><div class="value" id="p95">–</div></div>
+  <div class="card"><div class="label">p99</div><div class="value" id="p99">–</div></div>
+</section>
+
+<section class="panels">
+  <div class="panel">
+    <h2>Throughput (last 2 minutes)</h2>
+    <svg id="rps-chart" viewBox="0 0 600 120" preserveAspectRatio="none" aria-label="Requests per second over time"></svg>
+  </div>
+  <div class="panel">
+    <h2>Latency (mean / max per second)</h2>
+    <svg id="latency-chart" viewBox="0 0 600 120" preserveAspectRatio="none" aria-label="Latency over time"></svg>
+  </div>
+</section>
+
+<section class="panels">
+  <div class="panel">
+    <h2>Response statuses</h2>
+    <div class="scroll"><table><tbody id="statuses"></tbody></table></div>
+  </div>
+  <div class="panel">
+    <h2>Scenarios</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Step</th><th class="num">Requests</th><th class="num">Failed</th><th class="num">RPS</th><th class="num">Mean</th><th class="num">p95</th><th class="num">p99</th></tr></thead>
+        <tbody id="scenarios"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Recent failures</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Time</th><th>Step</th><th class="num">Status</th><th class="num">Latency</th><th>Error</th></tr></thead>
+      <tbody id="failures"></tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  Polling <code>/api/summary</code> and <code>/api/recent-results</code> every <span id="refresh"></span> ms.
+  Authorization headers, cookies, request bodies and configured secrets are redacted.
+</footer>
+
+<script>
+const REFRESH_MS = __REFRESH_MS__;
+document.getElementById('refresh').textContent = REFRESH_MS;
+
+const $ = (id) => document.getElementById(id);
+const num = (value, digits = 0) => Number(value ?? 0).toLocaleString(undefined, {
+  minimumFractionDigits: digits, maximumFractionDigits: digits,
+});
+
+function setStatus(status) {
+  const pill = $('status');
+  pill.textContent = status;
+  pill.className = 'pill ' + status;
+}
+
+function renderSummary(data) {
+  setStatus(data.status);
+  $('elapsed').textContent = num(data.elapsed_secs, 0) + 's elapsed';
+  $('rps').textContent = num(data.current_rps, 1);
+  $('total').textContent = num(data.total_requests);
+  $('failed').textContent = num(data.failed_requests);
+  const errorRate = $('error-rate');
+  errorRate.textContent = num(data.error_rate, 2) + '%';
+  errorRate.className = 'value ' + (data.error_rate > 0 ? 'bad' : 'ok');
+  $('mean').textContent = num(data.mean_latency_ms, 1) + ' ms';
+  $('p50').textContent = num(data.p50_latency_ms) + ' ms';
+  $('p95').textContent = num(data.p95_latency_ms) + ' ms';
+  $('p99').textContent = num(data.p99_latency_ms) + ' ms';
+  $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+
+  renderStatuses(data.status_codes || {});
+  renderScenarios(data.per_scenario || {}, data.skipped_scenarios || {});
+  drawChart('rps-chart', (data.timeline || []).map((point) => point.requests), '#58a6ff');
+  drawLatencyChart(data.timeline || []);
+}
+
+function renderStatuses(statuses) {
+  const rows = Object.entries(statuses);
+  const body = $('statuses');
+  body.textContent = '';
+  if (rows.length === 0) {
+    body.appendChild(emptyRow(3, 'No responses yet.'));
+    return;
+  }
+  const max = Math.max(...rows.map(([, count]) => count));
+  for (const [code, count] of rows) {
+    const numeric = Number(code);
+    const kind = numeric === 0 || numeric >= 500 ? 'bad' : numeric >= 400 ? 'warn' : '';
+    const row = document.createElement('tr');
+    row.appendChild(cell(numeric === 0 ? 'no response' : code));
+    const barCell = document.createElement('td');
+    const bar = document.createElement('div');
+    bar.className = 'bar ' + kind;
+    bar.style.width = Math.max(2, Math.round((count / max) * 100)) + '%';
+    barCell.appendChild(bar);
+    row.appendChild(barCell);
+    row.appendChild(cell(num(count), 'num'));
+    body.appendChild(row);
+  }
+}
+
+function renderScenarios(scenarios, skipped) {
+  const body = $('scenarios');
+  body.textContent = '';
+  const names = Object.keys(scenarios);
+  if (names.length === 0) {
+    body.appendChild(emptyRow(7, 'Simple mode: no scenario steps.'));
+  }
+  for (const name of names) {
+    const scenario = scenarios[name];
+    const row = document.createElement('tr');
+    const skips = skipped[name] || 0;
+    row.appendChild(cell(skips > 0 ? name + ' (' + skips + ' skipped)' : name));
+    row.appendChild(cell(num(scenario.total_requests), 'num'));
+    row.appendChild(cell(num(scenario.failed_requests), 'num'));
+    row.appendChild(cell(num(scenario.throughput_rps, 1), 'num'));
+    row.appendChild(cell(num(scenario.mean_latency_ms, 1), 'num'));
+    row.appendChild(cell(num(scenario.p95_latency_ms), 'num'));
+    row.appendChild(cell(num(scenario.p99_latency_ms), 'num'));
+    body.appendChild(row);
+  }
+}
+
+function renderFailures(failures) {
+  const body = $('failures');
+  body.textContent = '';
+  if (!failures || failures.length === 0) {
+    body.appendChild(emptyRow(5, 'No failures recorded.'));
+    return;
+  }
+  for (const failure of failures) {
+    const row = document.createElement('tr');
+    row.appendChild(cell(new Date(failure.timestamp).toLocaleTimeString()));
+    row.appendChild(cell(failure.scenario_name || '–'));
+    row.appendChild(cell(failure.status_code === 0 ? 'none' : failure.status_code, 'num'));
+    row.appendChild(cell(num(failure.latency_ms) + ' ms', 'num'));
+    row.appendChild(cell(failure.error || '', 'error-cell'));
+    body.appendChild(row);
+  }
+}
+
+function cell(text, className) {
+  const element = document.createElement('td');
+  element.textContent = text;
+  if (className) { element.className = className; }
+  return element;
+}
+
+function emptyRow(columns, text) {
+  const row = document.createElement('tr');
+  const element = document.createElement('td');
+  element.colSpan = columns;
+  element.className = 'empty';
+  element.textContent = text;
+  row.appendChild(element);
+  return row;
+}
+
+function pathFor(values, max) {
+  const width = 600;
+  const height = 120;
+  if (values.length === 0) { return ''; }
+  const step = values.length > 1 ? width / (values.length - 1) : width;
+  return values
+    .map((value, index) => {
+      const x = (index * step).toFixed(1);
+      const y = (height - (max > 0 ? (value / max) * (height - 10) : 0) - 5).toFixed(1);
+      return (index === 0 ? 'M' : 'L') + x + ' ' + y;
+    })
+    .join(' ');
+}
+
+function drawChart(id, values, color) {
+  const svg = $(id);
+  svg.textContent = '';
+  const max = Math.max(1, ...values);
+  svg.appendChild(line(pathFor(values, max), color));
+  svg.appendChild(label(num(max) + ' max'));
+}
+
+function drawLatencyChart(timeline) {
+  const svg = $('latency-chart');
+  svg.textContent = '';
+  const means = timeline.map((point) => point.mean_latency_ms);
+  const maxes = timeline.map((point) => point.max_latency_ms);
+  const max = Math.max(1, ...maxes);
+  svg.appendChild(line(pathFor(maxes, max), '#d29922'));
+  svg.appendChild(line(pathFor(means, max), '#3fb950'));
+  svg.appendChild(label(num(max) + ' ms max'));
+}
+
+function line(path, color) {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  element.setAttribute('d', path);
+  element.setAttribute('fill', 'none');
+  element.setAttribute('stroke', color);
+  element.setAttribute('stroke-width', '2');
+  element.setAttribute('vector-effect', 'non-scaling-stroke');
+  return element;
+}
+
+function label(text) {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+  element.setAttribute('x', '4');
+  element.setAttribute('y', '14');
+  element.setAttribute('fill', '#8b949e');
+  element.setAttribute('font-size', '11');
+  element.textContent = text;
+  return element;
+}
+
+async function poll() {
+  try {
+    const [summary, recent] = await Promise.all([
+      fetch('/api/summary', { cache: 'no-store' }).then((response) => response.json()),
+      fetch('/api/recent-results', { cache: 'no-store' }).then((response) => response.json()),
+    ]);
+    renderSummary(summary);
+    renderFailures(recent.failures);
+  } catch (error) {
+    // The run ends by closing this server, so a failed poll means the test
+    // finished or was cancelled.
+    setStatus('offline');
+    $('updated').textContent = 'run ended; data is final';
+  }
+}
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>

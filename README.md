@@ -19,6 +19,7 @@ Just Docker + YAML.
 - **Multipart form-data** with file upload support
 - **JSON + HTML reports** with beautiful charts
 - **Real-time terminal display** with progress bars
+- **Opt-in live web dashboard** for watching a run from a browser
 - **JSONPath extraction** for chaining requests
 - **Pure Docker usage** - no local installation needed
 - **High performance** - built with Rust for maximum throughput
@@ -109,6 +110,82 @@ quantiles, and the current request rate:
 ```bash
 curl http://localhost:9090/metrics
 ```
+
+### Live Web Dashboard
+
+Add a `live_dashboard` section to watch a run from a browser. It is opt-in:
+without the section Flux opens no socket at all.
+
+```yaml
+live_dashboard:
+  bind: "127.0.0.1:9090"   # loopback by default
+  refresh_ms: 1000         # poll interval used by the page
+  redact:                  # extra values to scrub from the dashboard
+    - "an-extra-secret"
+```
+
+Open `http://localhost:9090/` while the test runs. The page shows current RPS,
+error rate, mean and p50/p95/p99 latency, throughput and latency trends for the
+last two minutes, the response-status distribution, a per-scenario table
+(including skipped steps), and the most recent failures.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Self-contained dashboard page (no external assets) |
+| `GET /api/summary` | Current aggregate and per-scenario metrics, plus the run status |
+| `GET /api/recent-results` | Bounded, redacted sample of recent requests and failures |
+| `GET /healthz` | Run status (`running`, `completed`, `cancelled`), uptime, request count |
+
+```bash
+curl http://localhost:9090/api/summary
+curl http://localhost:9090/healthz
+```
+
+The page polls those endpoints every `refresh_ms` milliseconds. The server
+stops as soon as the run ends or is cancelled, so a closed port means the test
+is over — the JSON, HTML and CSV reports are still written as usual.
+
+#### Docker Usage
+
+Inside a container, loopback means the container's own loopback, so the
+dashboard must bind `0.0.0.0` and the port must be published:
+
+```yaml
+live_dashboard:
+  bind: "0.0.0.0:9090"
+```
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:9090:9090 \
+  -v ./config.yaml:/app/config.yaml \
+  -v ./results:/app/results \
+  flux:latest
+```
+
+Publishing as `-p 127.0.0.1:9090:9090` keeps the dashboard reachable from your
+machine only. `-p 9090:9090` binds every host interface instead.
+
+#### Network Exposure and Redaction
+
+The dashboard is unauthenticated, read-only HTTP. Anyone who can reach the port
+can read the metrics of the running test, so:
+
+- keep the default loopback bind, or publish the port to a trusted network only;
+- Flux logs a warning whenever `bind` is not a loopback address;
+- only `GET` is accepted, and unknown paths return 404.
+
+What the dashboard can show is deliberately narrow. It never serves request or
+response bodies, headers or cookies — the recent-request rows carry a scenario
+name, status code, latency, timestamp and the error message. Error messages are
+redacted before they leave the process:
+
+- values of credential headers (`Authorization`, `Cookie`, `X-Api-Key`, and
+  similar), request bodies and multipart field values from the configuration;
+- `Bearer` tokens, `user:password@` URL credentials and sensitive query
+  parameters (`token`, `api_key`, `password`, …), which covers secrets that only
+  exist at runtime, such as a token extracted from a response;
+- anything listed under `live_dashboard.redact`.
 
 ### POST with JSON Body
 
@@ -273,8 +350,18 @@ output:
 | `retry_delay` | string | No | 0s | Pause between retry attempts |
 | `retry_on_status` | array | No | [] | HTTP status codes eligible for retry |
 | `assertions` | object | No | - | Aggregate error-rate and latency quality gates |
+| `prometheus_port` | integer | No | - | Port for the live Prometheus metrics endpoint |
+| `live_dashboard` | object | No | - | Live web dashboard; no port is opened unless set |
 | `mode` | string | No | async | Execution mode: "async" or "sync" |
 | `output` | object | Yes | - | Output configuration |
+
+### Live Dashboard
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `bind` | string | No | 127.0.0.1:9090 | Listen address as `ip:port` |
+| `refresh_ms` | integer | No | 1000 | Page poll interval, between 100 and 60000 |
+| `redact` | array | No | [] | Extra literal values scrubbed from the dashboard |
 
 \* Required if not using scenarios with full URLs
 
@@ -580,6 +667,7 @@ See the `samples/` directory for complete examples:
 - `simple-post.yaml` - POST with JSON body
 - `multipart-upload.yaml` - File upload with multipart
 - `scenario-auth.yaml` - Multi-step authentication flow
+- `live-dashboard.yaml` - Run with the live web dashboard enabled
 
 ---
 
@@ -594,17 +682,22 @@ flux/
 │   ├── cancel.rs            # Cooperative cancellation token
 │   ├── config.rs            # YAML configuration parsing
 │   ├── client.rs            # HTTP client wrapper
+│   ├── dashboard.rs         # Opt-in live web dashboard
 │   ├── executor.rs          # Load test execution engine
 │   ├── metrics.rs           # Metrics collection
+│   ├── prometheus.rs        # Live Prometheus endpoint
+│   ├── redact.rs            # Secret redaction for live output
 │   ├── reporter.rs          # Report generation
 │   ├── ui.rs                # Terminal UI
 │   └── templates/
+│       ├── dashboard.html   # Live dashboard page
 │       └── report.html      # HTML report template
 ├── samples/
 │   ├── simple-get.yaml      # GET example
 │   ├── simple-post.yaml     # POST example
 │   ├── multipart-upload.yaml # Upload example
 │   ├── scenario-auth.yaml   # Scenario example
+│   ├── live-dashboard.yaml  # Live dashboard example
 │   └── sample.txt           # Sample file
 ├── data/                    # Directory for multipart files
 ├── results/                 # Directory for output reports

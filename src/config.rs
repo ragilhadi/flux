@@ -1,6 +1,7 @@
 use crate::metrics::MetricsSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -70,6 +71,12 @@ pub struct Config {
     /// Optional port for the live Prometheus metrics endpoint
     #[serde(default)]
     pub prometheus_port: Option<u16>,
+
+    /// Optional live web dashboard for the running test.
+    ///
+    /// Absent by default: no socket is opened unless this section exists.
+    #[serde(default)]
+    pub live_dashboard: Option<LiveDashboardConfig>,
 
     /// Execution mode: "async" or "sync"
     #[serde(default = "default_mode")]
@@ -151,6 +158,51 @@ pub struct Scenario {
     pub assertions: Option<ResponseAssertions>,
 }
 
+/// Live web dashboard settings.
+///
+/// The dashboard exposes run metrics over plain HTTP with no authentication,
+/// so it binds to loopback by default and every other address is opt-in.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LiveDashboardConfig {
+    /// Address to listen on, as `ip:port`.
+    #[serde(default = "default_dashboard_bind")]
+    pub bind: String,
+
+    /// How often the page refreshes its data, in milliseconds.
+    #[serde(default = "default_dashboard_refresh_ms")]
+    pub refresh_ms: u64,
+
+    /// Extra literal values to redact from anything the dashboard shows.
+    ///
+    /// Credential headers, request bodies and multipart field values are
+    /// redacted automatically; this covers secrets Flux cannot infer.
+    #[serde(default)]
+    pub redact: Vec<String>,
+}
+
+impl Default for LiveDashboardConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_dashboard_bind(),
+            refresh_ms: default_dashboard_refresh_ms(),
+            redact: Vec::new(),
+        }
+    }
+}
+
+impl LiveDashboardConfig {
+    /// Parse the configured bind address.
+    pub fn parse_bind(&self) -> anyhow::Result<SocketAddr> {
+        self.bind.trim().parse::<SocketAddr>().map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid live_dashboard.bind '{}'; expected an address such as \
+                 '127.0.0.1:9090', '0.0.0.0:9090' or '[::1]:9090'",
+                self.bind
+            )
+        })
+    }
+}
+
 /// Aggregate test-level quality gates.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AssertionsConfig {
@@ -215,6 +267,14 @@ fn default_max_results() -> usize {
     crate::metrics::DEFAULT_MAX_STORED_RESULTS
 }
 
+fn default_dashboard_bind() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+fn default_dashboard_refresh_ms() -> u64 {
+    1_000
+}
+
 impl Config {
     /// Load configuration from YAML file
     pub fn from_file(path: &PathBuf) -> anyhow::Result<Self> {
@@ -252,6 +312,20 @@ impl Config {
         validate_status_codes(&self.retry_on_status, "retry_on_status")?;
         if self.prometheus_port == Some(0) {
             anyhow::bail!("prometheus_port must be greater than 0");
+        }
+        if let Some(dashboard) = &self.live_dashboard {
+            let address = dashboard.parse_bind()?;
+            if address.port() == 0 {
+                anyhow::bail!("live_dashboard.bind must name a port greater than 0");
+            }
+            // A page that refreshes hundreds of times a second would compete
+            // with the load generator it is supposed to observe.
+            if !(100..=60_000).contains(&dashboard.refresh_ms) {
+                anyhow::bail!(
+                    "live_dashboard.refresh_ms must be between 100 and 60000, got {}",
+                    dashboard.refresh_ms
+                );
+            }
         }
         if let Some(assertions) = &self.assertions {
             if let Some(max_error_rate) = assertions.max_error_rate {
@@ -526,6 +600,12 @@ impl Config {
         self.think_time = expand_optional(self.think_time.take())?;
         self.retry_delay = expand_optional(self.retry_delay.take())?;
         self.mode = expand_environment_value(&self.mode)?;
+        if let Some(dashboard) = &mut self.live_dashboard {
+            dashboard.bind = expand_environment_value(&dashboard.bind)?;
+            for secret in &mut dashboard.redact {
+                *secret = expand_environment_value(secret)?;
+            }
+        }
         self.output.json = expand_environment_value(&self.output.json)?;
         self.output.html = expand_environment_value(&self.output.html)?;
         self.output.csv = expand_optional(self.output.csv.take())?;
@@ -699,6 +779,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
@@ -742,6 +823,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "out.json".to_string(),
@@ -788,6 +870,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "original.json".to_string(),
@@ -833,6 +916,7 @@ mod tests {
             retry_on_status: vec![503],
             assertions: None,
             prometheus_port: None,
+            live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
@@ -899,6 +983,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
@@ -929,6 +1014,86 @@ output:
 "#;
         let config: Config = serde_yaml::from_str(unlimited).unwrap();
         assert_eq!(config.output.max_results, 0);
+    }
+
+    #[test]
+    fn test_live_dashboard_is_absent_unless_configured() {
+        let yaml = r#"
+target: "http://example.com"
+output:
+  json: "output.json"
+  html: "output.html"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.live_dashboard.is_none());
+    }
+
+    #[test]
+    fn test_live_dashboard_defaults_to_loopback() {
+        let yaml = r#"
+target: "http://example.com"
+live_dashboard: {}
+output:
+  json: "output.json"
+  html: "output.html"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let dashboard = config.live_dashboard.as_ref().unwrap();
+
+        assert_eq!(dashboard.bind, "127.0.0.1:9090");
+        assert_eq!(dashboard.refresh_ms, 1_000);
+        assert!(dashboard.redact.is_empty());
+        assert!(dashboard.parse_bind().unwrap().ip().is_loopback());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_live_dashboard_accepts_explicit_settings() {
+        let yaml = r#"
+target: "http://example.com"
+live_dashboard:
+  bind: "0.0.0.0:8080"
+  refresh_ms: 500
+  redact:
+    - "my-secret"
+output:
+  json: "output.json"
+  html: "output.html"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        let dashboard = config.live_dashboard.as_ref().unwrap();
+
+        let address = dashboard.parse_bind().unwrap();
+        assert_eq!(address.port(), 8080);
+        assert!(!address.ip().is_loopback());
+        assert_eq!(dashboard.refresh_ms, 500);
+        assert_eq!(dashboard.redact, vec!["my-secret".to_string()]);
+    }
+
+    #[test]
+    fn test_live_dashboard_rejects_invalid_settings() {
+        let mut config = scenario_config(vec![]);
+        config.live_dashboard = Some(LiveDashboardConfig {
+            bind: "localhost:9090".to_string(),
+            ..Default::default()
+        });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Invalid live_dashboard.bind"), "{error}");
+
+        config.live_dashboard = Some(LiveDashboardConfig {
+            bind: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("greater than 0"), "{error}");
+
+        config.live_dashboard = Some(LiveDashboardConfig {
+            refresh_ms: 10,
+            ..Default::default()
+        });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("refresh_ms"), "{error}");
     }
 
     #[test]
@@ -1041,6 +1206,7 @@ output:
                 max_avg_ms: Some(200.0),
             }),
             prometheus_port: None,
+            live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
