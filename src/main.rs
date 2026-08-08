@@ -1,9 +1,11 @@
 mod cancel;
 mod client;
 mod config;
+mod dashboard;
 mod executor;
 mod metrics;
 mod prometheus;
+mod redact;
 mod reporter;
 mod ui;
 
@@ -11,6 +13,7 @@ use anyhow::Result;
 use cancel::Cancellation;
 use clap::Parser;
 use config::Config;
+use dashboard::LiveDashboard;
 use executor::Executor;
 use metrics::MetricsCollector;
 use prometheus::PrometheusServer;
@@ -179,6 +182,21 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    // Optional live dashboard. No socket exists unless it is configured.
+    let live_dashboard =
+        match LiveDashboard::maybe_start(&config, Arc::clone(&metrics), cancellation.clone()).await
+        {
+            Ok(Some(server)) => {
+                info!("Live dashboard available at {}", server.url());
+                Some(server)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                ui.display_error(&format!("Failed to start live dashboard: {e}"));
+                std::process::exit(1);
+            }
+        };
+
     // Start live metrics update task
     let metrics_clone = Arc::clone(&metrics);
     let ui_cancellation = cancellation.clone();
@@ -212,6 +230,14 @@ async fn main() -> Result<()> {
     if let Some(server) = prometheus_server {
         if let Err(e) = server.shutdown().await {
             error!("Failed to stop Prometheus endpoint cleanly: {}", e);
+        }
+    }
+
+    // The run is over — whether it finished or was cancelled — so the dashboard
+    // stops listening instead of serving a frozen view of a dead test.
+    if let Some(server) = live_dashboard {
+        if let Err(e) = server.shutdown().await {
+            error!("Failed to stop the live dashboard cleanly: {}", e);
         }
     }
 

@@ -1,13 +1,22 @@
 use chrono::{DateTime, Utc};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 /// Upper bound of the latency histogram, in milliseconds.
 const HISTOGRAM_MAX_MS: u64 = 300_000;
+
+/// Seconds of per-second history kept for the live dashboard trend charts.
+const TIMELINE_WINDOW_SECS: usize = 120;
+
+/// Number of recent requests, and recent failures, kept for the live view.
+const RECENT_SAMPLE_SIZE: usize = 50;
+
+/// Window used for the "current" request rate reported live, in seconds.
+const CURRENT_RPS_WINDOW_SECS: f64 = 5.0;
 
 /// Default number of raw request results kept in memory for reporting.
 ///
@@ -52,9 +61,30 @@ struct CollectorState {
     per_scenario: BTreeMap<String, Aggregate>,
     load_phase: LoadPhase,
     skipped_scenarios: BTreeMap<String, usize>,
+    /// Response status distribution over every request, including `0` for
+    /// requests that never produced a response.
+    status_codes: BTreeMap<u16, usize>,
+    /// Per-second history for the live trend charts, bounded to
+    /// `TIMELINE_WINDOW_SECS` buckets.
+    timeline: VecDeque<TimelineBucket>,
+    /// Most recent requests, bounded to `RECENT_SAMPLE_SIZE`.
+    recent: VecDeque<RecentResult>,
+    /// Most recent failures, bounded to `RECENT_SAMPLE_SIZE`.
+    recent_failures: VecDeque<RecentResult>,
     /// Streaming sink for raw rows, dropped by `close_result_stream` so the
     /// writer task can finish.
     csv_sink: Option<UnboundedSender<RequestResult>>,
+}
+
+/// One second of the live timeline.
+#[derive(Debug, Clone)]
+struct TimelineBucket {
+    /// Unix epoch second this bucket covers.
+    second: i64,
+    requests: usize,
+    failed: usize,
+    latency_sum: u128,
+    max_latency_ms: u64,
 }
 
 /// Streaming statistics for a set of requests.
@@ -145,6 +175,89 @@ pub struct LiveMetrics {
     pub total_requests: usize,
 }
 
+/// Point-in-time view of a running test.
+///
+/// Everything here is bounded in size — aggregates, a fixed-length timeline and
+/// per-scenario rows — so serving it repeatedly costs the same no matter how
+/// long the run has been going or how many requests it has made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSnapshot {
+    pub start_time: DateTime<Utc>,
+    pub elapsed_secs: f64,
+    pub total_requests: usize,
+    pub successful_requests: usize,
+    pub failed_requests: usize,
+    pub error_rate: f64,
+    /// Average rate over the whole run so far.
+    pub throughput_rps: f64,
+    /// Rate over the last few seconds, which is what the dashboard graphs.
+    pub current_rps: f64,
+    pub min_latency_ms: u64,
+    pub max_latency_ms: u64,
+    pub mean_latency_ms: f64,
+    pub p50_latency_ms: u64,
+    pub p90_latency_ms: u64,
+    pub p95_latency_ms: u64,
+    pub p99_latency_ms: u64,
+    /// Response status distribution; `0` counts requests that never got a
+    /// response (connection errors, timeouts).
+    pub status_codes: BTreeMap<u16, usize>,
+    pub per_scenario: BTreeMap<String, ScenarioMetricsSummary>,
+    pub skipped_scenarios: BTreeMap<String, usize>,
+    /// Per-second history, oldest first, for the trend charts.
+    pub timeline: Vec<TimelinePoint>,
+    pub retained_results: usize,
+    pub dropped_results: usize,
+}
+
+/// One second of throughput and latency history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelinePoint {
+    /// Unix epoch second this point covers.
+    pub second: i64,
+    pub requests: usize,
+    pub failed: usize,
+    pub mean_latency_ms: f64,
+    pub max_latency_ms: u64,
+}
+
+/// A single recent request, without any request or response payload.
+///
+/// Only the fields below ever leave the collector: there is no header, cookie
+/// or body data to leak. The `error` string can still quote a target URL, so
+/// callers that expose it (the dashboard) redact it first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentResult {
+    pub scenario_name: Option<String>,
+    pub status_code: u16,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Bounded sample of recent requests and recent failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentActivity {
+    /// Maximum number of rows either list can hold.
+    pub sample_size: usize,
+    /// Most recent requests, newest first.
+    pub results: Vec<RecentResult>,
+    /// Most recent failures, newest first.
+    pub failures: Vec<RecentResult>,
+}
+
+impl RecentResult {
+    fn from_request(result: &RequestResult) -> Self {
+        Self {
+            scenario_name: result.scenario_name.clone(),
+            status_code: result.status_code,
+            latency_ms: result.latency_ms,
+            error: result.error.clone(),
+            timestamp: result.request_end_timestamp,
+        }
+    }
+}
+
 impl Aggregate {
     fn new() -> Self {
         Self {
@@ -227,6 +340,76 @@ impl Aggregate {
     }
 }
 
+impl CollectorState {
+    /// Fold a result into the per-second timeline, dropping buckets older than
+    /// the window so the history stays a fixed size for the whole run.
+    fn observe_timeline(&mut self, result: &RequestResult) {
+        let second = result.request_end_timestamp.timestamp();
+
+        match self.timeline.back_mut() {
+            // Results can arrive slightly out of order, so anything not newer
+            // than the current bucket is folded into it rather than reordering
+            // history.
+            Some(bucket) if bucket.second >= second => {
+                bucket.requests += 1;
+                bucket.failed += usize::from(result.error.is_some());
+                bucket.latency_sum += result.latency_ms as u128;
+                bucket.max_latency_ms = bucket.max_latency_ms.max(result.latency_ms);
+            }
+            _ => {
+                self.timeline.push_back(TimelineBucket {
+                    second,
+                    requests: 1,
+                    failed: usize::from(result.error.is_some()),
+                    latency_sum: result.latency_ms as u128,
+                    max_latency_ms: result.latency_ms,
+                });
+                while self.timeline.len() > TIMELINE_WINDOW_SECS {
+                    self.timeline.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Keep a bounded tail of recent requests and recent failures.
+    fn observe_recent(&mut self, result: &RequestResult) {
+        push_bounded(&mut self.recent, RecentResult::from_request(result));
+        if result.error.is_some() {
+            push_bounded(
+                &mut self.recent_failures,
+                RecentResult::from_request(result),
+            );
+        }
+    }
+
+    /// Requests per second over the last `CURRENT_RPS_WINDOW_SECS`.
+    ///
+    /// Idle seconds have no bucket, so the window length — not the number of
+    /// buckets — is the divisor; a stalled test reports a falling rate rather
+    /// than the last busy second forever.
+    fn current_rps(&self, now: i64, elapsed_secs: f64) -> f64 {
+        let window_start = now - CURRENT_RPS_WINDOW_SECS as i64;
+        let requests: usize = self
+            .timeline
+            .iter()
+            .filter(|bucket| bucket.second > window_start && bucket.second <= now)
+            .map(|bucket| bucket.requests)
+            .sum();
+        let window = elapsed_secs.min(CURRENT_RPS_WINDOW_SECS);
+        if window <= 0.0 {
+            return 0.0;
+        }
+        requests as f64 / window
+    }
+}
+
+fn push_bounded(buffer: &mut VecDeque<RecentResult>, result: RecentResult) {
+    buffer.push_back(result);
+    while buffer.len() > RECENT_SAMPLE_SIZE {
+        buffer.pop_front();
+    }
+}
+
 impl MetricsCollector {
     /// Create a collector that retains every raw result.
     pub fn new() -> Self {
@@ -248,6 +431,10 @@ impl MetricsCollector {
                 per_scenario: BTreeMap::new(),
                 load_phase: LoadPhase::default(),
                 skipped_scenarios: BTreeMap::new(),
+                status_codes: BTreeMap::new(),
+                timeline: VecDeque::new(),
+                recent: VecDeque::new(),
+                recent_failures: VecDeque::new(),
                 csv_sink,
             })),
             start_time: Utc::now(),
@@ -301,6 +488,9 @@ impl MetricsCollector {
                 .or_insert_with(Aggregate::new)
                 .observe(&result);
         }
+        *state.status_codes.entry(result.status_code).or_default() += 1;
+        state.observe_timeline(&result);
+        state.observe_recent(&result);
         if state
             .load_phase
             .started_at
@@ -349,6 +539,90 @@ impl MetricsCollector {
             avg_latency_ms: state.aggregate.mean_latency_ms(),
             error_count: state.aggregate.failed,
             total_requests: total,
+        }
+    }
+
+    /// Take a bounded snapshot of the run so far.
+    ///
+    /// The work done under the lock is proportional to the number of scenarios
+    /// and the fixed timeline window, never to the number of requests made, so
+    /// polling this from the live dashboard cannot slow the load down as a run
+    /// grows. A poisoned lock yields an empty snapshot instead of panicking:
+    /// the dashboard is observability, and must never take the run down.
+    pub fn snapshot(&self) -> LiveSnapshot {
+        let elapsed = self.elapsed_secs();
+        let Ok(state) = self.state.lock() else {
+            return LiveSnapshot::empty(self.start_time, elapsed);
+        };
+
+        let total = state.aggregate.total;
+        let failed = state.aggregate.failed;
+        let throughput_rps = if elapsed > 0.0 {
+            total as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        LiveSnapshot {
+            start_time: self.start_time,
+            elapsed_secs: elapsed,
+            total_requests: total,
+            successful_requests: total - failed,
+            failed_requests: failed,
+            error_rate: state.aggregate.error_rate(),
+            throughput_rps,
+            current_rps: state.current_rps(Utc::now().timestamp(), elapsed),
+            min_latency_ms: state.aggregate.min(),
+            max_latency_ms: state.aggregate.max_latency_ms,
+            mean_latency_ms: state.aggregate.mean_latency_ms(),
+            p50_latency_ms: state.aggregate.histogram.value_at_quantile(0.50),
+            p90_latency_ms: state.aggregate.histogram.value_at_quantile(0.90),
+            p95_latency_ms: state.aggregate.histogram.value_at_quantile(0.95),
+            p99_latency_ms: state.aggregate.histogram.value_at_quantile(0.99),
+            status_codes: state.status_codes.clone(),
+            per_scenario: state
+                .per_scenario
+                .iter()
+                .map(|(name, aggregate)| (name.clone(), aggregate.summarize_scenario(elapsed)))
+                .collect(),
+            skipped_scenarios: state.skipped_scenarios.clone(),
+            timeline: state
+                .timeline
+                .iter()
+                .map(|bucket| TimelinePoint {
+                    second: bucket.second,
+                    requests: bucket.requests,
+                    failed: bucket.failed,
+                    mean_latency_ms: if bucket.requests == 0 {
+                        0.0
+                    } else {
+                        bucket.latency_sum as f64 / bucket.requests as f64
+                    },
+                    max_latency_ms: bucket.max_latency_ms,
+                })
+                .collect(),
+            retained_results: state.results.len(),
+            dropped_results: state.dropped_results,
+        }
+    }
+
+    /// Take the bounded sample of recent requests and failures, newest first.
+    ///
+    /// Rows carry no headers, cookies or payloads — only status, latency and
+    /// the error string, which the caller redacts before exposing it.
+    pub fn recent_activity(&self) -> RecentActivity {
+        let Ok(state) = self.state.lock() else {
+            return RecentActivity {
+                sample_size: RECENT_SAMPLE_SIZE,
+                results: Vec::new(),
+                failures: Vec::new(),
+            };
+        };
+
+        RecentActivity {
+            sample_size: RECENT_SAMPLE_SIZE,
+            results: state.recent.iter().rev().cloned().collect(),
+            failures: state.recent_failures.iter().rev().cloned().collect(),
         }
     }
 
@@ -490,6 +764,36 @@ impl MetricsCollector {
 impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl LiveSnapshot {
+    /// A snapshot with no observations, used when the collector state cannot be
+    /// read.
+    fn empty(start_time: DateTime<Utc>, elapsed_secs: f64) -> Self {
+        Self {
+            start_time,
+            elapsed_secs,
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            error_rate: 0.0,
+            throughput_rps: 0.0,
+            current_rps: 0.0,
+            min_latency_ms: 0,
+            max_latency_ms: 0,
+            mean_latency_ms: 0.0,
+            p50_latency_ms: 0,
+            p90_latency_ms: 0,
+            p95_latency_ms: 0,
+            p99_latency_ms: 0,
+            status_codes: BTreeMap::new(),
+            per_scenario: BTreeMap::new(),
+            skipped_scenarios: BTreeMap::new(),
+            timeline: Vec::new(),
+            retained_results: 0,
+            dropped_results: 0,
+        }
     }
 }
 
@@ -654,6 +958,145 @@ mod tests {
         assert_eq!(live.total_requests, 3);
         assert_eq!(live.error_count, 1);
         assert_eq!(live.avg_latency_ms, 200.0);
+    }
+
+    #[test]
+    fn test_live_snapshot_reports_aggregate_and_scenario_metrics() {
+        let collector = MetricsCollector::with_retention(2, None);
+
+        collector.record(result(Some("login"), 100, None));
+        collector.record(result(Some("login"), 300, None));
+        collector.record(result(Some("checkout"), 200, Some("HTTP 500")));
+        collector.record_skipped_scenario("profile");
+
+        let snapshot = collector.snapshot();
+
+        assert_eq!(snapshot.total_requests, 3);
+        assert_eq!(snapshot.successful_requests, 2);
+        assert_eq!(snapshot.failed_requests, 1);
+        assert!((snapshot.error_rate - 100.0 / 3.0).abs() < 0.001);
+        assert_eq!(snapshot.mean_latency_ms, 200.0);
+        assert_eq!(snapshot.min_latency_ms, 100);
+        assert_eq!(snapshot.max_latency_ms, 300);
+        assert_eq!(snapshot.status_codes.get(&200), Some(&2));
+        assert_eq!(snapshot.status_codes.get(&500), Some(&1));
+        assert_eq!(snapshot.skipped_scenarios.get("profile"), Some(&1));
+        assert_eq!(snapshot.retained_results, 2);
+        assert_eq!(snapshot.dropped_results, 1);
+
+        let login = snapshot.per_scenario.get("login").unwrap();
+        assert_eq!(login.total_requests, 2);
+        assert_eq!(login.failed_requests, 0);
+        let checkout = snapshot.per_scenario.get("checkout").unwrap();
+        assert_eq!(checkout.failed_requests, 1);
+        assert_eq!(checkout.error_rate, 100.0);
+    }
+
+    #[test]
+    fn test_live_snapshot_timeline_is_bounded_and_ordered() {
+        let collector = MetricsCollector::new();
+        let base = Utc::now();
+
+        // One request per second for twice the retained window.
+        for index in 0..(TIMELINE_WINDOW_SECS as i64 * 2) {
+            let timestamp = base + chrono::Duration::seconds(index);
+            collector.record(RequestResult {
+                scenario_name: None,
+                latency_ms: 10,
+                status_code: 200,
+                error: None,
+                request_start_timestamp: timestamp,
+                request_end_timestamp: timestamp,
+            });
+        }
+
+        let snapshot = collector.snapshot();
+
+        // History stays a fixed size no matter how long the run lasts, and the
+        // oldest seconds are the ones dropped.
+        assert_eq!(snapshot.timeline.len(), TIMELINE_WINDOW_SECS);
+        assert_eq!(snapshot.total_requests, TIMELINE_WINDOW_SECS * 2);
+        let seconds: Vec<i64> = snapshot.timeline.iter().map(|point| point.second).collect();
+        assert!(seconds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(*seconds.last().unwrap(), base.timestamp() + 239);
+        assert!(snapshot
+            .timeline
+            .iter()
+            .all(|point| point.requests == 1 && point.mean_latency_ms == 10.0));
+    }
+
+    #[test]
+    fn test_live_snapshot_groups_requests_in_the_same_second() {
+        let collector = MetricsCollector::new();
+        let timestamp = Utc::now();
+
+        for latency in [10, 20, 60] {
+            collector.record(RequestResult {
+                scenario_name: None,
+                latency_ms: latency,
+                status_code: if latency == 60 { 503 } else { 200 },
+                error: (latency == 60).then(|| "HTTP 503".to_string()),
+                request_start_timestamp: timestamp,
+                request_end_timestamp: timestamp,
+            });
+        }
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.timeline.len(), 1);
+        let point = &snapshot.timeline[0];
+        assert_eq!(point.requests, 3);
+        assert_eq!(point.failed, 1);
+        assert_eq!(point.mean_latency_ms, 30.0);
+        assert_eq!(point.max_latency_ms, 60);
+    }
+
+    #[test]
+    fn test_current_rps_falls_off_when_the_run_goes_idle() {
+        let collector = MetricsCollector::new();
+        let now = Utc::now();
+
+        // Ten requests, all a minute in the past: well outside the live window.
+        for _ in 0..10 {
+            let timestamp = now - chrono::Duration::seconds(60);
+            collector.record(RequestResult {
+                scenario_name: None,
+                latency_ms: 5,
+                status_code: 200,
+                error: None,
+                request_start_timestamp: timestamp,
+                request_end_timestamp: timestamp,
+            });
+        }
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.current_rps, 0.0);
+        // The all-run average still counts them.
+        assert_eq!(snapshot.total_requests, 10);
+    }
+
+    #[test]
+    fn test_recent_activity_is_bounded_and_newest_first() {
+        let collector = MetricsCollector::new();
+
+        let recorded = RECENT_SAMPLE_SIZE as u64 * 3;
+        for index in 1..=recorded {
+            let error = (index % 2 == 0).then_some("HTTP 500");
+            collector.record(result(Some("step"), index, error));
+        }
+
+        let activity = collector.recent_activity();
+
+        assert_eq!(activity.sample_size, RECENT_SAMPLE_SIZE);
+        assert_eq!(activity.results.len(), RECENT_SAMPLE_SIZE);
+        assert_eq!(activity.failures.len(), RECENT_SAMPLE_SIZE);
+        // Newest first, and only failures land in the failure list.
+        assert_eq!(activity.results[0].latency_ms, recorded);
+        assert!(activity.results[0].latency_ms > activity.results[1].latency_ms);
+        assert!(activity
+            .failures
+            .iter()
+            .all(|failure| failure.error.as_deref() == Some("HTTP 500")));
+        assert!(activity.failures[0].latency_ms > activity.failures[1].latency_ms);
     }
 
     #[test]

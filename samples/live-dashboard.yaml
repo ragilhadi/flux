@@ -1,0 +1,26 @@
+# Live web dashboard example
+#
+# Open http://localhost:9090/ while the test runs. Inside Docker, bind to
+# 0.0.0.0 and publish the port: see README "Live Web Dashboard".
+target: "https://jsonplaceholder.typicode.com/posts/1"
+method: "GET"
+
+headers:
+  Accept: "application/json"
+
+concurrency: 10
+duration: "60s"
+mode: "async"
+
+live_dashboard:
+  # Loopback only: the dashboard has no authentication.
+  bind: "127.0.0.1:9090"
+  # How often the page polls for fresh data.
+  refresh_ms: 1000
+  # Extra values to scrub from anything the dashboard displays. Credential
+  # headers, request bodies and multipart fields are redacted automatically.
+  redact: []
+
+output:
+  json: "/app/results/live-dashboard.json"
+  html: "/app/results/live-dashboard.html"
