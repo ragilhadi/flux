@@ -1,5 +1,6 @@
 mod cancel;
 mod client;
+mod compare;
 mod config;
 mod dashboard;
 mod executor;
@@ -11,7 +12,8 @@ mod ui;
 
 use anyhow::Result;
 use cancel::Cancellation;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
+use compare::{Budgets, Threshold};
 use config::Config;
 use dashboard::LiveDashboard;
 use executor::Executor;
@@ -27,8 +29,16 @@ use tracing::{error, info};
 use ui::TerminalUI;
 
 #[derive(Debug, Parser)]
-#[command(name = "flux", about = "A configurable HTTP load-testing tool")]
+#[command(
+    name = "flux",
+    about = "A configurable HTTP load-testing tool",
+    version
+)]
 struct Cli {
+    /// Subcommand to run. Without one, Flux runs a load test.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to the YAML configuration file
     #[arg(short, long, env = "FLUX_CONFIG")]
     config: Option<PathBuf>,
@@ -54,6 +64,146 @@ struct Cli {
     output_csv: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Compare two JSON reports and enforce regression budgets
+    ///
+    /// Nothing is executed against the target: both runs must already have
+    /// been recorded with --output-json.
+    Compare(CompareArgs),
+}
+
+/// Regression budgets accept either a percentage of the baseline (`10%`) or an
+/// absolute movement in the metric's own unit (`25` / `25ms`).
+#[derive(Debug, Args)]
+struct CompareArgs {
+    /// Baseline JSON report
+    baseline: PathBuf,
+
+    /// Candidate JSON report to check against the baseline
+    candidate: PathBuf,
+
+    /// Budget for the increase in mean latency
+    #[arg(long, value_name = "BUDGET")]
+    max_mean_regression: Option<String>,
+
+    /// Budget for the increase in p50 latency
+    #[arg(long, value_name = "BUDGET")]
+    max_p50_regression: Option<String>,
+
+    /// Budget for the increase in p90 latency
+    #[arg(long, value_name = "BUDGET")]
+    max_p90_regression: Option<String>,
+
+    /// Budget for the increase in p95 latency
+    #[arg(long, value_name = "BUDGET")]
+    max_p95_regression: Option<String>,
+
+    /// Budget for the increase in p99 latency
+    #[arg(long, value_name = "BUDGET")]
+    max_p99_regression: Option<String>,
+
+    /// Budget for the increase in error rate, in percentage points (0.5 means
+    /// 0.5pp, for example 1.0% to 1.5%)
+    #[arg(long, value_name = "POINTS")]
+    max_error_rate_increase: Option<String>,
+
+    /// Budget for the drop in throughput
+    #[arg(long, value_name = "BUDGET")]
+    max_throughput_drop: Option<String>,
+
+    /// Apply the same budgets to every scenario present in both reports
+    #[arg(long)]
+    per_scenario_budgets: bool,
+
+    /// Write the comparison as JSON to this path
+    #[arg(long, value_name = "PATH")]
+    output_json: Option<PathBuf>,
+
+    /// Write the comparison as Markdown to this path, for a CI job summary
+    #[arg(long, value_name = "PATH")]
+    output_markdown: Option<PathBuf>,
+}
+
+impl CompareArgs {
+    /// Turn the raw budget strings into parsed thresholds.
+    fn budgets(&self) -> Result<Budgets> {
+        let threshold = |raw: &Option<String>| -> Result<Option<Threshold>> {
+            raw.as_deref().map(Threshold::parse).transpose()
+        };
+
+        Ok(Budgets {
+            mean_latency: threshold(&self.max_mean_regression)?,
+            p50_latency: threshold(&self.max_p50_regression)?,
+            p90_latency: threshold(&self.max_p90_regression)?,
+            p95_latency: threshold(&self.max_p95_regression)?,
+            p99_latency: threshold(&self.max_p99_regression)?,
+            error_rate_increase: self
+                .max_error_rate_increase
+                .as_deref()
+                .map(compare::parse_error_rate_budget)
+                .transpose()?,
+            throughput_drop: threshold(&self.max_throughput_drop)?,
+            per_scenario: self.per_scenario_budgets,
+        })
+    }
+}
+
+/// Exit code used when a comparison exceeds a configured regression budget.
+const EXIT_BUDGET_EXCEEDED: i32 = 1;
+
+/// Exit code used when a comparison could not be made at all.
+const EXIT_COMPARISON_FAILED: i32 = 2;
+
+/// Run `flux compare` and exit with the code CI should act on.
+fn run_compare(args: &CompareArgs) -> ! {
+    let budgets = match args.budgets() {
+        Ok(budgets) => budgets,
+        Err(e) => {
+            eprintln!("Invalid regression budget: {e:#}");
+            std::process::exit(EXIT_COMPARISON_FAILED);
+        }
+    };
+
+    let comparison = match compare::compare_reports(&args.baseline, &args.candidate, budgets) {
+        Ok(comparison) => comparison,
+        Err(e) => {
+            eprintln!("Failed to compare reports: {e:#}");
+            std::process::exit(EXIT_COMPARISON_FAILED);
+        }
+    };
+
+    print!("{}", compare::render_terminal(&comparison));
+
+    if let Some(path) = &args.output_json {
+        let rendered = match compare::render_json(&comparison) {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                eprintln!("Failed to render the JSON comparison: {e:#}");
+                std::process::exit(EXIT_COMPARISON_FAILED);
+            }
+        };
+        if let Err(e) = compare::write_artifact(path, &rendered) {
+            eprintln!("Failed to write the JSON comparison: {e:#}");
+            std::process::exit(EXIT_COMPARISON_FAILED);
+        }
+        println!("JSON comparison saved to: {}", path.display());
+    }
+
+    if let Some(path) = &args.output_markdown {
+        if let Err(e) = compare::write_artifact(path, &compare::render_markdown(&comparison)) {
+            eprintln!("Failed to write the Markdown comparison: {e:#}");
+            std::process::exit(EXIT_COMPARISON_FAILED);
+        }
+        println!("Markdown comparison saved to: {}", path.display());
+    }
+
+    if comparison.passed() {
+        std::process::exit(0);
+    }
+    std::process::exit(EXIT_BUDGET_EXCEEDED);
+}
+
 /// Resolve the configuration file path from CLI args, env var, or default.
 fn resolve_config_path(cli: &Cli) -> PathBuf {
     cli.config
@@ -72,6 +222,12 @@ async fn main() -> Result<()> {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
+
+    // Comparing two recorded reports sends no traffic anywhere, so it returns
+    // before any configuration is loaded or any executor is built.
+    if let Some(Command::Compare(args)) = &cli.command {
+        run_compare(args);
+    }
 
     info!("Starting Flux load testing tool");
 
@@ -330,5 +486,89 @@ mod tests {
         assert_eq!(cli.output_json.as_deref(), Some("result.json"));
         assert_eq!(cli.output_html.as_deref(), Some("report.html"));
         assert_eq!(cli.output_csv.as_deref(), Some("results.csv"));
+        assert!(cli.command.is_none());
+    }
+
+    fn compare_args(argv: &[&str]) -> CompareArgs {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Compare(args)) => args,
+            other => panic!("expected a compare subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compare_subcommand_parses_reports_and_budgets() {
+        let args = compare_args(&[
+            "flux",
+            "compare",
+            "artifacts/baseline.json",
+            "artifacts/current.json",
+            "--max-p95-regression",
+            "10%",
+            "--max-error-rate-increase",
+            "0.5",
+        ]);
+
+        assert_eq!(args.baseline, PathBuf::from("artifacts/baseline.json"));
+        assert_eq!(args.candidate, PathBuf::from("artifacts/current.json"));
+
+        let budgets = args.budgets().unwrap();
+        assert_eq!(budgets.p95_latency, Some(Threshold::Percent(10.0)));
+        assert_eq!(budgets.error_rate_increase, Some(0.5));
+        assert!(!budgets.per_scenario);
+    }
+
+    #[test]
+    fn test_compare_subcommand_parses_every_budget() {
+        let args = compare_args(&[
+            "flux",
+            "compare",
+            "baseline.json",
+            "current.json",
+            "--max-mean-regression",
+            "5%",
+            "--max-p50-regression",
+            "10ms",
+            "--max-p90-regression",
+            "15",
+            "--max-p99-regression",
+            "20%",
+            "--max-throughput-drop",
+            "8%",
+            "--per-scenario-budgets",
+            "--output-json",
+            "comparison.json",
+            "--output-markdown",
+            "comparison.md",
+        ]);
+
+        let budgets = args.budgets().unwrap();
+        assert_eq!(budgets.mean_latency, Some(Threshold::Percent(5.0)));
+        assert_eq!(budgets.p50_latency, Some(Threshold::Absolute(10.0)));
+        assert_eq!(budgets.p90_latency, Some(Threshold::Absolute(15.0)));
+        assert_eq!(budgets.p99_latency, Some(Threshold::Percent(20.0)));
+        assert_eq!(budgets.throughput_drop, Some(Threshold::Percent(8.0)));
+        assert!(budgets.per_scenario);
+        assert_eq!(args.output_json, Some(PathBuf::from("comparison.json")));
+        assert_eq!(args.output_markdown, Some(PathBuf::from("comparison.md")));
+    }
+
+    #[test]
+    fn test_compare_rejects_an_unparseable_budget() {
+        let args = compare_args(&[
+            "flux",
+            "compare",
+            "baseline.json",
+            "current.json",
+            "--max-p95-regression",
+            "ten percent",
+        ]);
+
+        assert!(args.budgets().is_err());
+    }
+
+    #[test]
+    fn test_compare_requires_both_reports() {
+        assert!(Cli::try_parse_from(["flux", "compare", "baseline.json"]).is_err());
     }
 }

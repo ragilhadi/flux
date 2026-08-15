@@ -18,6 +18,7 @@ Just Docker + YAML.
 - **Multi-step scenarios** with variable extraction
 - **Multipart form-data** with file upload support
 - **JSON + HTML reports** with beautiful charts
+- **Report comparison** with regression budgets for CI (`flux compare`)
 - **Real-time terminal display** with progress bars
 - **Opt-in live web dashboard** for watching a run from a browser
 - **JSONPath extraction** for chaining requests
@@ -488,7 +489,9 @@ flux --config ./load-test.yaml --concurrency 50 --duration 60s \
   --output-json results.json --output-html report.html --output-csv requests.csv
 ```
 
-Run `flux --help` for the complete flag reference.
+Run `flux --help` for the complete flag reference, and `flux compare --help`
+for the report comparison subcommand described in
+[Comparing Reports and Regression Budgets](#-comparing-reports-and-regression-budgets).
 
 ---
 
@@ -559,6 +562,7 @@ Contains full raw data and summary statistics:
 
 ```json
 {
+  "schema_version": 1,
   "summary": {
     "total_requests": 12430,
     "successful_requests": 12002,
@@ -567,11 +571,19 @@ Contains full raw data and summary statistics:
     "p50_latency_ms": 84,
     "p90_latency_ms": 152,
     "p99_latency_ms": 231,
-    "error_rate": 3.44
+    "error_rate": 3.44,
+    "status_codes": { "0": 12, "200": 12002, "500": 416 },
+    "per_scenario": { "...": {} }
   },
   "results": [...]
 }
 ```
+
+`schema_version` records the layout of the document so `flux compare` knows
+what it is reading. Reports written before versioning existed carry no such
+field and are read as schema `v0`; they still compare, minus anything they did
+not record. `status_codes` counts every request by response status, with `0`
+for requests that never got a response (connection errors, timeouts).
 
 ### HTML Report
 
@@ -581,6 +593,172 @@ Beautiful interactive report with:
 - Latency over time line chart
 - Status code distribution pie chart
 - Percentiles table
+
+---
+
+## 🆚 Comparing Reports and Regression Budgets
+
+`flux compare` reads two JSON reports that already exist and reports what
+changed between them. It sends no traffic, needs no configuration file, and
+exits non-zero when a configured regression budget is exceeded — which is what
+makes it usable as a CI gate.
+
+```bash
+flux --config perf.yaml --output-json artifacts/current.json
+
+flux compare artifacts/baseline.json artifacts/current.json \
+  --max-p95-regression 10% --max-error-rate-increase 0.5
+```
+
+The comparison covers request counts, throughput, error rate, mean and
+p50/p90/p95/p99 latency, and the status-code distribution — aggregate first,
+then every scenario present in both reports:
+
+```
+Aggregate Deltas:
+  Metric                       Baseline      Candidate          Delta           Change       Budget
+  total requests                   1000           1000              0             0.0%            -
+  throughput                33.30 req/s    30.00 req/s    -3.30 req/s            -9.9%            -
+  error rate                      0.20%          1.10%        +0.90pp          +450.0%        0.5pp
+  p95 latency                     110ms          140ms          +30ms           +27.3%          10%
+
+Status Code Distribution:
+  Status         Baseline    Candidate      Delta     Base %     Cand %
+  none                  0            1         +1       0.0%       0.1%
+  200                 998          989         -9      99.8%      98.9%
+  500                   2           10         +8       0.2%       1.0%
+
+❌ FAIL — regression budgets exceeded:
+  • aggregate error rate: +0.90pp exceeds the 0.5pp increase budget
+  • aggregate p95 latency: +30ms (+27.3%) exceeds the 10% increase budget
+```
+
+### Budgets
+
+| Flag | Budget on | Accepts |
+|------|-----------|---------|
+| `--max-mean-regression` | increase in mean latency | `10%` or `25` / `25ms` |
+| `--max-p50-regression` | increase in p50 latency | `10%` or `25` / `25ms` |
+| `--max-p90-regression` | increase in p90 latency | `10%` or `25` / `25ms` |
+| `--max-p95-regression` | increase in p95 latency | `10%` or `25` / `25ms` |
+| `--max-p99-regression` | increase in p99 latency | `10%` or `25` / `25ms` |
+| `--max-throughput-drop` | drop in throughput | `10%` or `5` / `5 req/s` |
+| `--max-error-rate-increase` | increase in error rate | percentage points, e.g. `0.5` |
+| `--per-scenario-budgets` | applies the same budgets to each shared scenario | flag |
+
+A budget ending in `%` is relative to the baseline; anything else is absolute,
+in the metric's own unit. Error rate is itself a percentage, so its budget is
+always in **percentage points** (`0.5` means 1.0% → 1.5% fails); a `%` sign
+there is rejected rather than guessed at.
+
+Only budgets you pass are enforced. With none, the comparison prints the deltas
+and exits `0`.
+
+### Denominators, added and removed scenarios
+
+- Percentage change always uses the **baseline** as the denominator. When the
+  baseline value is `0` there is no denominator, so the change is printed as
+  `n/a (baseline 0)` rather than a fabricated number — and a percentage budget
+  treats any movement in the bad direction from a zero baseline as exceeded.
+- Status-code shares are a percentage of that report's own total requests, and
+  print as `n/a` when a run made no requests at all.
+- Scenarios are matched by name. Scenarios only in the candidate are listed as
+  **added** (no delta exists), scenarios only in the baseline as **removed**.
+  Per-scenario budgets apply only to scenarios present in both.
+- If either report predates status recording, the status table is skipped with
+  a note instead of reporting every status as new.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | every configured budget met (or none configured) |
+| `1` | at least one budget exceeded |
+| `2` | the comparison could not be made (missing/unreadable report, unparseable budget, report written by a newer schema) |
+
+### CI artifacts
+
+```bash
+flux compare baseline.json current.json \
+  --max-p95-regression 10% \
+  --output-json comparison.json \
+  --output-markdown comparison.md
+```
+
+`--output-json` writes the full comparison (every delta, the budgets, and each
+violation) for later processing; `--output-markdown` writes tables ready to
+paste into a job summary or a PR comment. Both are written before the exit code
+is decided, so they exist even when the run fails.
+
+### GitHub Actions example
+
+```yaml
+name: Performance
+
+on: pull_request
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore the performance baseline
+        uses: actions/cache@v4
+        with:
+          path: artifacts/baseline.json
+          key: flux-baseline-${{ hashFiles('perf.yaml') }}
+
+      - name: Run the load test
+        run: |
+          mkdir -p artifacts
+          docker run --rm \
+            -v ${{ github.workspace }}/perf.yaml:/app/config.yaml \
+            -v ${{ github.workspace }}/artifacts:/app/results \
+            ragilhadi/flux:latest --output-json /app/results/current.json
+
+      - name: Compare against the baseline
+        if: hashFiles('artifacts/baseline.json') != ''
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/artifacts:/artifacts \
+            ragilhadi/flux:latest compare \
+              /artifacts/baseline.json /artifacts/current.json \
+              --max-p95-regression 10% \
+              --max-error-rate-increase 0.5 \
+              --output-markdown /artifacts/comparison.md
+
+      - name: Publish the comparison
+        if: always() && hashFiles('artifacts/comparison.md') != ''
+        run: cat artifacts/comparison.md >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flux-performance
+          path: artifacts/
+```
+
+The compare step fails the job on exit code `1`, and the summary shows which
+budget was exceeded.
+
+### Read the result honestly
+
+Two runs of the same test never produce the same numbers: a shared CI runner
+adds far more variance than most code changes do. A comparison is an
+**operational budget check, not a statistical test**, and Flux prints that
+caveat with every comparison.
+
+To keep it meaningful:
+
+- record the baseline on the same class of machine as the candidate, and
+  refresh it when the environment changes;
+- run long enough that percentiles settle — seconds-long runs mostly measure
+  noise;
+- set budgets wide enough to clear the noise you observe between two unchanged
+  runs, then tighten them;
+- re-run before acting on a result that lands close to its budget, rather than
+  reading a single close call as proof of a regression.
 
 ---
 
@@ -680,6 +858,7 @@ flux/
 ├── src/
 │   ├── main.rs              # Entry point and orchestration
 │   ├── cancel.rs            # Cooperative cancellation token
+│   ├── compare.rs           # Report comparison and regression budgets
 │   ├── config.rs            # YAML configuration parsing
 │   ├── client.rs            # HTTP client wrapper
 │   ├── dashboard.rs         # Opt-in live web dashboard

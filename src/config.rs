@@ -1235,6 +1235,7 @@ output:
             start_time: chrono::Utc::now(),
             end_time: chrono::Utc::now(),
             per_scenario: Default::default(),
+            status_codes: Default::default(),
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,

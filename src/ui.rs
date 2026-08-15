@@ -286,6 +286,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: Default::default(),
+            status_codes: Default::default(),
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
