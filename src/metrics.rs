@@ -135,6 +135,12 @@ pub struct MetricsSummary {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub per_scenario: BTreeMap<String, ScenarioMetricsSummary>,
+    /// Response status distribution over every request; `0` counts requests
+    /// that never produced a response. Reports written before this field
+    /// existed simply omit it, and comparisons say so rather than reading the
+    /// absence as "no responses".
+    #[serde(default)]
+    pub status_codes: BTreeMap<u16, usize>,
     /// Scenario steps skipped at runtime because a dependency failed, and how
     /// often. Configuration mistakes never reach this map: they fail the run
     /// before any request is sent.
@@ -695,6 +701,7 @@ impl MetricsCollector {
             start_time: self.start_time,
             end_time,
             per_scenario,
+            status_codes: state.status_codes.clone(),
             skipped_scenarios: state.skipped_scenarios.clone(),
             retained_results: state.results.len(),
             dropped_results: state.dropped_results,

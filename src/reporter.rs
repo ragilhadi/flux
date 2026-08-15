@@ -1,3 +1,4 @@
+use crate::compare::REPORT_SCHEMA_VERSION;
 use crate::metrics::{MetricsSummary, RequestResult};
 use anyhow::Result;
 use serde::Serialize;
@@ -10,6 +11,10 @@ use tokio::task::JoinHandle;
 /// Report data structure
 #[derive(Debug, Serialize)]
 pub struct Report {
+    /// Layout of this document, so `flux compare` knows what it is reading.
+    /// Reports written before versioning carry no such field and are read as
+    /// the legacy schema.
+    pub schema_version: u32,
     pub summary: MetricsSummary,
     pub results: Vec<RequestResult>,
 }
@@ -29,7 +34,11 @@ impl Reporter {
     /// Create a new reporter
     pub fn new(summary: MetricsSummary, results: Vec<RequestResult>) -> Self {
         Self {
-            report: Report { summary, results },
+            report: Report {
+                schema_version: REPORT_SCHEMA_VERSION,
+                summary,
+                results,
+            },
         }
     }
 
@@ -256,6 +265,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: Default::default(),
+            status_codes: Default::default(),
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
@@ -314,6 +324,51 @@ mod tests {
     }
 
     #[test]
+    fn test_json_report_is_versioned_and_carries_the_status_distribution() {
+        let summary = MetricsSummary {
+            total_requests: 2,
+            successful_requests: 1,
+            failed_requests: 1,
+            total_duration_secs: 1.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 1.0,
+            measured_requests: 2,
+            throughput_rps: 2.0,
+            min_latency_ms: 10,
+            max_latency_ms: 20,
+            mean_latency_ms: 15.0,
+            p50_latency_ms: 10,
+            p90_latency_ms: 20,
+            p95_latency_ms: 20,
+            p99_latency_ms: 20,
+            error_rate: 50.0,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            per_scenario: Default::default(),
+            status_codes: std::collections::BTreeMap::from([(200, 1), (500, 1)]),
+            skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "flux-report-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        Reporter::new(summary, Vec::new())
+            .generate_json(path.to_str().unwrap())
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(report["schema_version"], REPORT_SCHEMA_VERSION);
+        assert_eq!(report["summary"]["status_codes"]["200"], 1);
+        assert_eq!(report["summary"]["status_codes"]["500"], 1);
+    }
+
+    #[test]
     fn test_html_contains_per_scenario_table() {
         let scenario = ScenarioMetricsSummary {
             total_requests: 2,
@@ -349,6 +404,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: std::collections::BTreeMap::from([("login".to_string(), scenario)]),
+            status_codes: Default::default(),
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
@@ -384,6 +440,7 @@ mod tests {
             start_time: Utc::now(),
             end_time: Utc::now(),
             per_scenario: Default::default(),
+            status_codes: Default::default(),
             skipped_scenarios: Default::default(),
             retained_results: 100,
             dropped_results: 900,
