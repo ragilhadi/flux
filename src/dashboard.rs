@@ -365,6 +365,7 @@ mod tests {
             duration: "1s".to_string(),
             timeout: "1s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,

@@ -1,0 +1,24 @@
+# Staged load profile: ramp concurrency from 10 to 100 users, hold, then
+# ramp back down. Useful for answering "does the API stay stable as load
+# rises?" and for modeling a traffic spike (a short high-concurrency stage).
+target: "https://jsonplaceholder.typicode.com/posts/1"
+method: "GET"
+
+headers:
+  Accept: "application/json"
+
+load_profile:
+  type: stages
+  stages:
+    - duration: "30s"
+      target_concurrency: 10
+    - duration: "2m"
+      target_concurrency: 100
+    - duration: "30s"
+      target_concurrency: 0
+
+mode: "async"
+
+output:
+  json: "/app/results/staged-load-profile.json"
+  html: "/app/results/staged-load-profile.html"

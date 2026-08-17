@@ -15,6 +15,7 @@ Just Docker + YAML.
 ## 🚀 Features
 
 - **Async or Sync** load generation with Tokio
+- **Load profiles**: fixed concurrency, staged ramps/spikes, or a target arrival rate
 - **Multi-step scenarios** with variable extraction
 - **Multipart form-data** with file upload support
 - **JSON + HTML reports** with beautiful charts
@@ -328,6 +329,55 @@ output:
   html: "/app/results/report.html"
 ```
 
+### Staged Load Profile (Ramp / Hold / Spike)
+
+Ramp concurrency through a sequence of levels instead of a single fixed
+value. Each stage is held for its own duration, so this models a gradual
+ramp, a hold period, a ramp-down, or — with a short high-concurrency stage —
+a traffic spike:
+
+```yaml
+target: "https://api.example.com/health"
+
+load_profile:
+  type: stages
+  stages:
+    - duration: "30s"
+      target_concurrency: 10   # warm up
+    - duration: "2m"
+      target_concurrency: 100  # hold at peak
+    - duration: "15s"
+      target_concurrency: 300  # spike
+    - duration: "30s"
+      target_concurrency: 0    # ramp down
+
+output:
+  json: "/app/results/staged.json"
+  html: "/app/results/staged.html"
+```
+
+### Arrival-Rate Load Profile
+
+Pace request starts at a fixed target rate instead of driving a fixed
+worker count, bounded by `max_concurrency` in-flight requests:
+
+```yaml
+target: "https://api.example.com/health"
+
+load_profile:
+  type: arrival_rate
+  target_rps: 200
+  duration: "5m"
+  max_concurrency: 500  # optional; defaults to 1000
+
+output:
+  json: "/app/results/arrival-rate.json"
+  html: "/app/results/arrival-rate.html"
+```
+
+See [Load Profiles](#-load-profiles) below for how staging and arrival-rate
+pacing work, and what shows up in the reports.
+
 ---
 
 ## 📊 Configuration Options
@@ -346,6 +396,7 @@ output:
 | `duration` | string | No | 30s | Test duration (e.g., "30s", "5m", "1h") |
 | `timeout` | string | No | 30s | Per-request timeout (e.g., "5s", "2m") |
 | `ramp_up` | string | No | - | Warm-up: spread worker startup over this duration, *before* `duration` starts |
+| `load_profile` | object | No | - | Staged or arrival-rate load profile; mutually exclusive with `ramp_up` |
 | `think_time` | string | No | - | Pause after each simple-mode request |
 | `retry_count` | integer | No | 0 | Retry attempts after the initial request |
 | `retry_delay` | string | No | 0s | Pause between retry attempts |
@@ -355,6 +406,26 @@ output:
 | `live_dashboard` | object | No | - | Live web dashboard; no port is opened unless set |
 | `mode` | string | No | async | Execution mode: "async" or "sync" |
 | `output` | object | Yes | - | Output configuration |
+
+### Load Profile
+
+`load_profile.type` is either `stages` or `arrival_rate`.
+
+**`stages`**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `stages` | array | Yes | At least one stage, held in order |
+| `stages[].duration` | string | Yes | How long this stage is held (e.g. "30s", "2m") |
+| `stages[].target_concurrency` | integer | Yes | Worker count active during this stage (`0` allowed, for a ramp-down) |
+
+**`arrival_rate`**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `target_rps` | number | Yes | - | Target requests started per second |
+| `duration` | string | Yes | - | How long the profile runs |
+| `max_concurrency` | integer | No | 1000 | Maximum in-flight requests |
 
 ### Live Dashboard
 
@@ -519,6 +590,68 @@ reports separate the two:
 - `ramp_up_secs` — time spent starting workers;
 - `measured_duration_secs` / `measured_requests` — the full-concurrency window;
 - `throughput_rps` — requests per second over the measured window only.
+
+## 🌊 Load Profiles
+
+`concurrency` (with optional `ramp_up`) models a fixed number of workers. For
+traffic shapes that isn't enough — a stepped ramp, a hold period, a spike, or
+a target requests-per-second — configure `load_profile` instead. It replaces
+`concurrency`, `duration` and `ramp_up`: the profile's own stages or
+arrival-rate duration decide how long the run takes, and `--concurrency` /
+`--duration` command-line overrides are rejected when `load_profile` is set,
+so timing always comes from one place.
+
+### Stages
+
+```yaml
+load_profile:
+  type: stages
+  stages:
+    - duration: "30s"
+      target_concurrency: 10
+    - duration: "2m"
+      target_concurrency: 100
+    - duration: "30s"
+      target_concurrency: 0
+```
+
+Every worker any stage could need is started up front; a worker outside the
+active stage's `target_concurrency` idles instead of sending requests. That
+keeps stage transitions predictable — concurrency changes on schedule with no
+worker-startup latency mid-run — while still using ordinary worker loops
+underneath, so retries, think time, scenarios and cancellation all behave
+exactly as they do for fixed concurrency.
+
+### Arrival Rate
+
+```yaml
+load_profile:
+  type: arrival_rate
+  target_rps: 200
+  duration: "5m"
+  max_concurrency: 500
+```
+
+Request starts are paced at `target_rps` — independent of how long each
+request takes — rather than driven by a worker loop. In-flight requests are
+bounded by `max_concurrency`: when the target rate outpaces what the backend
+can sustain, a pacing tick that finds no free slot is counted as **saturated**
+and skipped rather than queued, so an overloaded target shows up as a number
+in the report instead of unbounded pending work.
+
+### What Shows Up in Reports
+
+Both profiles add to the terminal summary, the JSON report and the HTML
+report:
+
+- `load_profile` — the profile's `kind`, plus `target_rps` / `achieved_rps`
+  and `scheduled_ticks` / `saturated_ticks` for `arrival_rate`;
+- `stages` — one entry per stage (or one entry for the whole arrival-rate
+  window) with its configured target, planned duration, and the usual
+  request/latency/error metrics observed while it was active.
+
+A plain fixed-concurrency run has no `load_profile` and an empty `stages`
+list, so existing reports and tooling are unaffected.
 
 ## 🛑 Stopping a Test Early
 

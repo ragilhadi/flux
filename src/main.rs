@@ -261,15 +261,16 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Ramp-up precedes the measured window, so the run lasts ramp-up + duration.
-    let ramp_up_secs = match config.parse_ramp_up() {
-        Ok(ramp_up) => ramp_up.map(|ramp_up| ramp_up.as_secs()).unwrap_or(0),
+    // The planned wall-clock length of the run: duration + ramp-up for a
+    // fixed-concurrency profile, or the sum of stage/arrival-rate durations
+    // when `load_profile` is configured.
+    let total_secs = match config.total_planned_secs() {
+        Ok(secs) => secs,
         Err(e) => {
-            eprintln!("Failed to parse ramp-up: {}", e);
+            eprintln!("Failed to compute planned test duration: {}", e);
             std::process::exit(1);
         }
     };
-    let total_secs = duration_secs.saturating_add(ramp_up_secs);
 
     // Per-request CSV rows are streamed to disk as they are produced, so the
     // full-fidelity export never has to be held in memory.

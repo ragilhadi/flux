@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, LoadProfile};
 use crate::metrics::{LiveMetrics, MetricsSummary};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -33,18 +33,50 @@ impl TerminalUI {
             println!("{:<20} : {}", "Target".bright_yellow(), target);
         }
 
-        println!(
-            "{:<20} : {} workers",
-            "Concurrency".bright_yellow(),
-            config.concurrency
-        );
-        println!("{:<20} : {}s", "Duration".bright_yellow(), duration_secs);
-        if let Some(ramp_up) = &config.ramp_up {
-            println!(
-                "{:<20} : {} (warm-up, added before the measured duration)",
-                "Ramp-up".bright_yellow(),
-                ramp_up
-            );
+        match &config.load_profile {
+            Some(LoadProfile::Stages { stages }) => {
+                println!(
+                    "{:<20} : {} stage(s)",
+                    "Load profile".bright_yellow(),
+                    stages.len()
+                );
+                for (index, stage) in stages.iter().enumerate() {
+                    println!(
+                        "  {:<18} : {} workers for {}",
+                        format!("Stage {}", index + 1),
+                        stage.target_concurrency,
+                        stage.duration
+                    );
+                }
+            }
+            Some(LoadProfile::ArrivalRate {
+                target_rps,
+                duration,
+                max_concurrency,
+            }) => {
+                println!(
+                    "{:<20} : {:.2} req/s for {} (max {} concurrent)",
+                    "Load profile".bright_yellow(),
+                    target_rps,
+                    duration,
+                    max_concurrency
+                );
+            }
+            None => {
+                println!(
+                    "{:<20} : {} workers",
+                    "Concurrency".bright_yellow(),
+                    config.concurrency
+                );
+                println!("{:<20} : {}s", "Duration".bright_yellow(), duration_secs);
+                if let Some(ramp_up) = &config.ramp_up {
+                    println!(
+                        "{:<20} : {} (warm-up, added before the measured duration)",
+                        "Ramp-up".bright_yellow(),
+                        ramp_up
+                    );
+                }
+            }
         }
         if let Some(think_time) = &config.think_time {
             println!("{:<20} : {}", "Think time".bright_yellow(), think_time);
@@ -194,6 +226,50 @@ impl TerminalUI {
             );
         }
 
+        if let Some(profile) = &summary.load_profile {
+            println!("\n{}", "Load Profile:".bright_green().bold());
+            println!("  {:<25} : {}", "Type".bright_white(), profile.kind);
+            if let Some(target) = profile.target_rps {
+                println!(
+                    "  {:<25} : {:.2} req/s",
+                    "Target Rate".bright_white(),
+                    target
+                );
+            }
+            if let Some(achieved) = profile.achieved_rps {
+                println!(
+                    "  {:<25} : {:.2} req/s",
+                    "Achieved Rate".bright_white(),
+                    achieved
+                );
+            }
+            if profile.scheduled_ticks > 0 {
+                let saturation =
+                    profile.saturated_ticks as f64 / profile.scheduled_ticks as f64 * 100.0;
+                println!(
+                    "  {:<25} : {} of {} ({:.1}%)",
+                    "Saturated Ticks".bright_white(),
+                    profile.saturated_ticks,
+                    profile.scheduled_ticks,
+                    saturation
+                );
+            }
+        }
+
+        if !summary.stages.is_empty() {
+            println!("\n{}", "Per-Stage Metrics:".bright_green().bold());
+            for stage in &summary.stages {
+                println!(
+                    "  {:<25} : {} req | {:.2} req/s | p95 {}ms | errors {:.1}%",
+                    stage.label.bright_white(),
+                    stage.metrics.total_requests,
+                    stage.metrics.throughput_rps,
+                    stage.metrics.p95_latency_ms,
+                    stage.metrics.error_rate
+                );
+            }
+        }
+
         // Latency percentiles
         println!("\n{}", "Latency Percentiles:".bright_green().bold());
         println!(
@@ -255,12 +331,78 @@ impl TerminalUI {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{OutputConfig, Stage};
+    use crate::metrics::{LoadProfileSummary, ScenarioMetricsSummary, StageSummary};
     use chrono::Utc;
+    use std::collections::HashMap;
 
     #[test]
     fn test_terminal_ui_creation() {
         let _ui = TerminalUI::new(30);
         // Test passes if no panic occurs
+    }
+
+    fn base_config() -> Config {
+        Config {
+            target: Some("http://example.com".to_string()),
+            method: Some("GET".to_string()),
+            headers: HashMap::new(),
+            body: None,
+            multipart: None,
+            scenarios: vec![],
+            concurrency: 10,
+            duration: "30s".to_string(),
+            timeout: "30s".to_string(),
+            ramp_up: None,
+            load_profile: None,
+            think_time: None,
+            retry_count: 0,
+            retry_delay: None,
+            retry_on_status: vec![],
+            assertions: None,
+            prometheus_port: None,
+            live_dashboard: None,
+            mode: "async".to_string(),
+            output: OutputConfig {
+                json: "output.json".to_string(),
+                html: "output.html".to_string(),
+                csv: None,
+                max_results: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_display_banner_with_stages_profile_does_not_panic() {
+        let ui = TerminalUI::new(30);
+        let mut config = base_config();
+        config.load_profile = Some(LoadProfile::Stages {
+            stages: vec![
+                Stage {
+                    duration: "30s".to_string(),
+                    target_concurrency: 10,
+                },
+                Stage {
+                    duration: "1m".to_string(),
+                    target_concurrency: 100,
+                },
+            ],
+        });
+
+        ui.display_banner(&config, 90);
+    }
+
+    #[test]
+    fn test_display_banner_with_arrival_rate_profile_does_not_panic() {
+        let ui = TerminalUI::new(30);
+        let mut config = base_config();
+        config.load_profile = Some(LoadProfile::ArrivalRate {
+            target_rps: 200.0,
+            duration: "5m".to_string(),
+            max_concurrency: 500,
+        });
+
+        ui.display_banner(&config, 300);
     }
 
     #[test]
@@ -290,9 +432,71 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            load_profile: None,
+            stages: Vec::new(),
         };
 
         // This will print to stdout, but we're just testing it doesn't panic
         _ui.display_summary(&summary);
+    }
+
+    #[test]
+    fn test_display_summary_with_load_profile_and_stages_does_not_panic() {
+        let ui = TerminalUI::new(30);
+        let stage_metrics = ScenarioMetricsSummary {
+            total_requests: 100,
+            successful_requests: 95,
+            failed_requests: 5,
+            throughput_rps: 10.0,
+            min_latency_ms: 5,
+            max_latency_ms: 200,
+            mean_latency_ms: 40.0,
+            p50_latency_ms: 30,
+            p90_latency_ms: 80,
+            p95_latency_ms: 120,
+            p99_latency_ms: 180,
+            error_rate: 5.0,
+        };
+        let summary = MetricsSummary {
+            total_requests: 100,
+            successful_requests: 95,
+            failed_requests: 5,
+            total_duration_secs: 10.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 10.0,
+            measured_requests: 100,
+            throughput_rps: 10.0,
+            min_latency_ms: 5,
+            max_latency_ms: 200,
+            mean_latency_ms: 40.0,
+            p50_latency_ms: 30,
+            p90_latency_ms: 80,
+            p95_latency_ms: 120,
+            p99_latency_ms: 180,
+            error_rate: 5.0,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            per_scenario: Default::default(),
+            status_codes: Default::default(),
+            skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
+            load_profile: Some(LoadProfileSummary {
+                kind: "arrival_rate".to_string(),
+                target_rps: Some(50.0),
+                achieved_rps: Some(48.5),
+                scheduled_ticks: 100,
+                saturated_ticks: 3,
+            }),
+            stages: vec![StageSummary {
+                label: "Arrival rate (50.00 req/s)".to_string(),
+                target_concurrency: None,
+                target_rps: Some(50.0),
+                planned_duration_secs: 10.0,
+                metrics: stage_metrics,
+            }],
+        };
+
+        ui.display_summary(&summary);
     }
 }

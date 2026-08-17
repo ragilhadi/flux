@@ -269,6 +269,8 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            load_profile: None,
+            stages: Vec::new(),
         };
 
         let reporter = Reporter::new(summary, results);
@@ -349,6 +351,8 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            load_profile: None,
+            stages: Vec::new(),
         };
         let path = std::env::temp_dir().join(format!(
             "flux-report-{}-{}.json",
@@ -408,6 +412,8 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            load_profile: None,
+            stages: Vec::new(),
         };
         let reporter = Reporter::new(summary, Vec::new());
 
@@ -444,6 +450,8 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 100,
             dropped_results: 900,
+            load_profile: None,
+            stages: Vec::new(),
         };
         let reporter = Reporter::new(summary, Vec::new());
 
@@ -451,5 +459,107 @@ mod tests {
         assert!(html.contains("Retained Results"));
         assert!(html.contains("100 of"), "{html}");
         assert!(html.contains("900 per-request"), "{html}");
+    }
+
+    #[test]
+    fn test_html_omits_load_profile_section_for_a_plain_run() {
+        let summary = MetricsSummary {
+            total_requests: 1,
+            successful_requests: 1,
+            failed_requests: 0,
+            total_duration_secs: 1.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 1.0,
+            measured_requests: 1,
+            throughput_rps: 1.0,
+            min_latency_ms: 10,
+            max_latency_ms: 10,
+            mean_latency_ms: 10.0,
+            p50_latency_ms: 10,
+            p90_latency_ms: 10,
+            p95_latency_ms: 10,
+            p99_latency_ms: 10,
+            error_rate: 0.0,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            per_scenario: Default::default(),
+            status_codes: Default::default(),
+            skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
+            load_profile: None,
+            stages: Vec::new(),
+        };
+        let reporter = Reporter::new(summary, Vec::new());
+
+        let html = reporter.render_html().unwrap();
+        assert!(!html.contains("Load Profile"));
+        assert!(!html.contains("Per-Stage Metrics"));
+    }
+
+    #[test]
+    fn test_html_contains_load_profile_and_per_stage_tables() {
+        use crate::metrics::{LoadProfileSummary, ScenarioMetricsSummary, StageSummary};
+
+        let stage_metrics = ScenarioMetricsSummary {
+            total_requests: 50,
+            successful_requests: 48,
+            failed_requests: 2,
+            throughput_rps: 25.0,
+            min_latency_ms: 5,
+            max_latency_ms: 100,
+            mean_latency_ms: 20.0,
+            p50_latency_ms: 15,
+            p90_latency_ms: 40,
+            p95_latency_ms: 60,
+            p99_latency_ms: 90,
+            error_rate: 4.0,
+        };
+        let summary = MetricsSummary {
+            total_requests: 50,
+            successful_requests: 48,
+            failed_requests: 2,
+            total_duration_secs: 2.0,
+            ramp_up_secs: 0.0,
+            measured_duration_secs: 2.0,
+            measured_requests: 50,
+            throughput_rps: 25.0,
+            min_latency_ms: 5,
+            max_latency_ms: 100,
+            mean_latency_ms: 20.0,
+            p50_latency_ms: 15,
+            p90_latency_ms: 40,
+            p95_latency_ms: 60,
+            p99_latency_ms: 90,
+            error_rate: 4.0,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            per_scenario: Default::default(),
+            status_codes: Default::default(),
+            skipped_scenarios: Default::default(),
+            retained_results: 0,
+            dropped_results: 0,
+            load_profile: Some(LoadProfileSummary {
+                kind: "arrival_rate".to_string(),
+                target_rps: Some(30.0),
+                achieved_rps: Some(25.0),
+                scheduled_ticks: 60,
+                saturated_ticks: 5,
+            }),
+            stages: vec![StageSummary {
+                label: "Arrival rate (30.00 req/s)".to_string(),
+                target_concurrency: None,
+                target_rps: Some(30.0),
+                planned_duration_secs: 2.0,
+                metrics: stage_metrics,
+            }],
+        };
+        let reporter = Reporter::new(summary, Vec::new());
+
+        let html = reporter.render_html().unwrap();
+        assert!(html.contains("Load Profile"));
+        assert!(html.contains("arrival_rate"));
+        assert!(html.contains("Per-Stage Metrics"));
+        assert!(html.contains("Arrival rate (30.00 req/s)"));
     }
 }

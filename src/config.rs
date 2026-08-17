@@ -48,6 +48,13 @@ pub struct Config {
     #[serde(default)]
     pub ramp_up: Option<String>,
 
+    /// Optional load profile describing how load changes over the run —
+    /// staged concurrency or a target request-arrival rate — as an
+    /// alternative to the fixed `concurrency` (with optional `ramp_up`)
+    /// above. Mutually exclusive with `ramp_up`.
+    #[serde(default)]
+    pub load_profile: Option<LoadProfile>,
+
     /// Optional pause between requests in simple mode
     #[serde(default)]
     pub think_time: Option<String>,
@@ -103,6 +110,39 @@ pub struct MultipartPart {
     /// Field value (for type="field")
     #[serde(default)]
     pub value: Option<String>,
+}
+
+/// A load profile describes how load should change over the life of a run,
+/// as an alternative to a fixed `concurrency`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoadProfile {
+    /// Ramp concurrency through a sequence of levels, each held for a fixed
+    /// duration — a stepped load, a hold period, or a spike.
+    Stages { stages: Vec<Stage> },
+
+    /// Pace request starts at a fixed target rate instead of driving a fixed
+    /// worker count, bounded by `max_concurrency` in-flight requests.
+    ArrivalRate {
+        target_rps: f64,
+        duration: String,
+        #[serde(default = "default_arrival_max_concurrency")]
+        max_concurrency: usize,
+    },
+}
+
+/// One step of a `stages` load profile.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Stage {
+    /// How long this stage is held (e.g. "30s", "2m").
+    pub duration: String,
+
+    /// Number of concurrent workers active during this stage.
+    pub target_concurrency: usize,
+}
+
+fn default_arrival_max_concurrency() -> usize {
+    1_000
 }
 
 /// Scenario step definition
@@ -307,6 +347,7 @@ impl Config {
         // Ramp-up is warm-up time added in front of the measured window, so it
         // is allowed to be longer than the configured duration.
         self.parse_ramp_up()?;
+        self.validate_load_profile()?;
         self.parse_think_time()?;
         self.parse_retry_delay()?;
         validate_status_codes(&self.retry_on_status, "retry_on_status")?;
@@ -463,6 +504,102 @@ impl Config {
         Ok(())
     }
 
+    /// Validate the optional load profile.
+    ///
+    /// A load profile replaces the fixed `concurrency` (with optional
+    /// `ramp_up`) model, so the two cannot be combined — warm-up should be
+    /// expressed as a stage instead.
+    fn validate_load_profile(&self) -> anyhow::Result<()> {
+        let Some(profile) = &self.load_profile else {
+            return Ok(());
+        };
+
+        if self.ramp_up.is_some() {
+            anyhow::bail!(
+                "ramp_up cannot be combined with load_profile; express warm-up \
+                 as a leading stage instead"
+            );
+        }
+
+        match profile {
+            LoadProfile::Stages { stages } => {
+                if stages.is_empty() {
+                    anyhow::bail!("load_profile.stages must contain at least one stage");
+                }
+                for (index, stage) in stages.iter().enumerate() {
+                    // `parse_duration` itself rejects a zero duration, so
+                    // stages can never be given a no-op hold time.
+                    parse_duration(&stage.duration).map_err(|e| {
+                        anyhow::anyhow!("Invalid duration for stage {}: {e}", index + 1)
+                    })?;
+                }
+            }
+            LoadProfile::ArrivalRate {
+                target_rps,
+                duration,
+                max_concurrency,
+            } => {
+                if !target_rps.is_finite() || *target_rps <= 0.0 {
+                    anyhow::bail!("load_profile.target_rps must be greater than 0");
+                }
+                parse_duration(duration)
+                    .map_err(|e| anyhow::anyhow!("Invalid load_profile.duration: {e}"))?;
+                if *max_concurrency == 0 {
+                    anyhow::bail!("load_profile.max_concurrency must be greater than 0");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parsed `(duration, target_concurrency)` for each stage, in order, when
+    /// a `stages` load profile is configured.
+    pub fn parsed_stages(&self) -> anyhow::Result<Option<Vec<(Duration, usize)>>> {
+        match &self.load_profile {
+            Some(LoadProfile::Stages { stages }) => Ok(Some(
+                stages
+                    .iter()
+                    .map(|stage| Ok((parse_duration(&stage.duration)?, stage.target_concurrency)))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// Parsed `(target_rps, duration, max_concurrency)` when an
+    /// `arrival_rate` load profile is configured.
+    pub fn parsed_arrival_rate(&self) -> anyhow::Result<Option<(f64, Duration, usize)>> {
+        match &self.load_profile {
+            Some(LoadProfile::ArrivalRate {
+                target_rps,
+                duration,
+                max_concurrency,
+            }) => Ok(Some((
+                *target_rps,
+                parse_duration(duration)?,
+                *max_concurrency,
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Total wall-clock time the run is expected to take, across every
+    /// profile: `duration + ramp_up` for fixed concurrency, or the sum of
+    /// stage durations / the arrival-rate duration when `load_profile` is
+    /// configured.
+    pub fn total_planned_secs(&self) -> anyhow::Result<u64> {
+        if let Some(stages) = self.parsed_stages()? {
+            return Ok(stages.iter().map(|(duration, _)| duration.as_secs()).sum());
+        }
+        if let Some((_, duration, _)) = self.parsed_arrival_rate()? {
+            return Ok(duration.as_secs());
+        }
+        let duration = self.parse_duration()?;
+        let ramp_up = self.parse_ramp_up()?.map(|d| d.as_secs()).unwrap_or(0);
+        Ok(duration + ramp_up)
+    }
+
     /// Parse duration string to seconds
     pub fn parse_duration(&self) -> anyhow::Result<u64> {
         let seconds = parse_duration(&self.duration)?.as_secs();
@@ -527,6 +664,12 @@ impl Config {
         output_html: Option<String>,
         output_csv: Option<String>,
     ) -> anyhow::Result<()> {
+        if self.load_profile.is_some() && (concurrency.is_some() || duration.is_some()) {
+            anyhow::bail!(
+                "--concurrency/--duration cannot override a configuration that \
+                 defines load_profile; edit load_profile in the YAML instead"
+            );
+        }
         if let Some(concurrency) = concurrency {
             self.concurrency = concurrency;
         }
@@ -597,6 +740,18 @@ impl Config {
         self.duration = expand_environment_value(&self.duration)?;
         self.timeout = expand_environment_value(&self.timeout)?;
         self.ramp_up = expand_optional(self.ramp_up.take())?;
+        if let Some(profile) = &mut self.load_profile {
+            match profile {
+                LoadProfile::Stages { stages } => {
+                    for stage in stages {
+                        stage.duration = expand_environment_value(&stage.duration)?;
+                    }
+                }
+                LoadProfile::ArrivalRate { duration, .. } => {
+                    *duration = expand_environment_value(duration)?;
+                }
+            }
+        }
         self.think_time = expand_optional(self.think_time.take())?;
         self.retry_delay = expand_optional(self.retry_delay.take())?;
         self.mode = expand_environment_value(&self.mode)?;
@@ -773,6 +928,7 @@ mod tests {
             duration: "30s".to_string(),
             timeout: "30s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -817,6 +973,7 @@ mod tests {
             duration: "1s".to_string(),
             timeout: "250ms".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -864,6 +1021,7 @@ mod tests {
             duration: "30s".to_string(),
             timeout: "30s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -910,6 +1068,7 @@ mod tests {
             duration: "30s".to_string(),
             timeout: "5s".to_string(),
             ramp_up: Some("10s".to_string()),
+            load_profile: None,
             think_time: Some("250ms".to_string()),
             retry_count: 2,
             retry_delay: Some("0s".to_string()),
@@ -977,6 +1136,7 @@ mod tests {
             duration: "1s".to_string(),
             timeout: "1s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -1195,6 +1355,7 @@ output:
             duration: "1s".to_string(),
             timeout: "1s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -1239,6 +1400,8 @@ output:
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            load_profile: None,
+            stages: Vec::new(),
         };
 
         let failures = config.evaluate_assertions(&summary);
@@ -1247,5 +1410,241 @@ output:
             .iter()
             .any(|failure| failure.contains("error rate")));
         assert!(failures.iter().any(|failure| failure.contains("p99")));
+    }
+
+    fn stages_config(stages: Vec<Stage>) -> Config {
+        let mut config = scenario_config(vec![]);
+        config.load_profile = Some(LoadProfile::Stages { stages });
+        config
+    }
+
+    fn arrival_rate_config(target_rps: f64, duration: &str, max_concurrency: usize) -> Config {
+        let mut config = scenario_config(vec![]);
+        config.load_profile = Some(LoadProfile::ArrivalRate {
+            target_rps,
+            duration: duration.to_string(),
+            max_concurrency,
+        });
+        config
+    }
+
+    #[test]
+    fn test_stages_profile_parses_and_validates() {
+        let config = stages_config(vec![
+            Stage {
+                duration: "30s".to_string(),
+                target_concurrency: 10,
+            },
+            Stage {
+                duration: "2m".to_string(),
+                target_concurrency: 100,
+            },
+            Stage {
+                duration: "30s".to_string(),
+                target_concurrency: 0,
+            },
+        ]);
+
+        config.validate().unwrap();
+        let stages = config.parsed_stages().unwrap().unwrap();
+        assert_eq!(
+            stages,
+            vec![
+                (Duration::from_secs(30), 10),
+                (Duration::from_secs(120), 100),
+                (Duration::from_secs(30), 0),
+            ]
+        );
+        assert_eq!(config.total_planned_secs().unwrap(), 180);
+        assert!(config.parsed_arrival_rate().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_stages_profile_rejects_empty_stage_list() {
+        let config = stages_config(vec![]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("at least one stage"), "{error}");
+    }
+
+    #[test]
+    fn test_stages_profile_rejects_zero_duration_stage() {
+        let config = stages_config(vec![Stage {
+            duration: "0s".to_string(),
+            target_concurrency: 10,
+        }]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Invalid duration for stage 1"), "{error}");
+        assert!(error.contains("greater than zero"), "{error}");
+    }
+
+    #[test]
+    fn test_stages_profile_rejects_unparseable_duration() {
+        let config = stages_config(vec![Stage {
+            duration: "not-a-duration".to_string(),
+            target_concurrency: 10,
+        }]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Invalid duration for stage 1"), "{error}");
+    }
+
+    #[test]
+    fn test_arrival_rate_profile_parses_and_validates() {
+        let config = arrival_rate_config(200.0, "5m", 500);
+        config.validate().unwrap();
+
+        let (target_rps, duration, max_concurrency) =
+            config.parsed_arrival_rate().unwrap().unwrap();
+        assert_eq!(target_rps, 200.0);
+        assert_eq!(duration, Duration::from_secs(300));
+        assert_eq!(max_concurrency, 500);
+        assert_eq!(config.total_planned_secs().unwrap(), 300);
+        assert!(config.parsed_stages().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_arrival_rate_defaults_max_concurrency() {
+        let yaml = r#"
+target: "http://example.com"
+load_profile:
+  type: arrival_rate
+  target_rps: 50
+  duration: "1m"
+output:
+  json: "output.json"
+  html: "output.html"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        let (_, _, max_concurrency) = config.parsed_arrival_rate().unwrap().unwrap();
+        assert_eq!(max_concurrency, 1_000);
+    }
+
+    #[test]
+    fn test_arrival_rate_rejects_non_positive_target_rps() {
+        let config = arrival_rate_config(0.0, "1m", 10);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("target_rps"), "{error}");
+
+        let config = arrival_rate_config(-5.0, "1m", 10);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_arrival_rate_rejects_zero_max_concurrency() {
+        let config = arrival_rate_config(10.0, "1m", 0);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_concurrency"), "{error}");
+    }
+
+    #[test]
+    fn test_load_profile_rejects_ramp_up_combination() {
+        let mut config = stages_config(vec![Stage {
+            duration: "10s".to_string(),
+            target_concurrency: 5,
+        }]);
+        config.ramp_up = Some("5s".to_string());
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("ramp_up cannot be combined"), "{error}");
+    }
+
+    #[test]
+    fn test_overrides_reject_concurrency_and_duration_with_load_profile() {
+        let mut config = stages_config(vec![Stage {
+            duration: "10s".to_string(),
+            target_concurrency: 5,
+        }]);
+
+        let error = config
+            .apply_overrides(Some(50), None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("load_profile"), "{error}");
+
+        let error = config
+            .apply_overrides(None, Some("1m".to_string()), None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("load_profile"), "{error}");
+
+        // Overriding only output paths is unaffected.
+        config
+            .apply_overrides(None, None, Some("out.json".to_string()), None, None)
+            .unwrap();
+        assert_eq!(config.output.json, "out.json");
+    }
+
+    #[test]
+    fn test_stage_durations_expand_environment_variables() {
+        std::env::set_var("FLUX_TEST_STAGE_DURATION", "15s");
+        let yaml = r#"
+target: "http://example.com"
+load_profile:
+  type: stages
+  stages:
+    - duration: "${FLUX_TEST_STAGE_DURATION}"
+      target_concurrency: 5
+output:
+  json: "output.json"
+  html: "output.html"
+"#;
+        let config = Config::from_file(&{
+            let path = std::env::temp_dir().join(format!(
+                "flux-load-profile-{}-{}.yaml",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            std::fs::write(&path, yaml).unwrap();
+            path
+        })
+        .unwrap();
+        std::env::remove_var("FLUX_TEST_STAGE_DURATION");
+
+        let stages = config.parsed_stages().unwrap().unwrap();
+        assert_eq!(stages, vec![(Duration::from_secs(15), 5)]);
+    }
+
+    #[test]
+    fn test_total_planned_secs_covers_every_profile() {
+        let constant = scenario_config(vec![]);
+        assert_eq!(constant.total_planned_secs().unwrap(), 1);
+
+        let mut with_ramp_up = scenario_config(vec![]);
+        with_ramp_up.ramp_up = Some("4s".to_string());
+        assert_eq!(with_ramp_up.total_planned_secs().unwrap(), 5);
+
+        let staged = stages_config(vec![
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 1,
+            },
+            Stage {
+                duration: "20s".to_string(),
+                target_concurrency: 2,
+            },
+        ]);
+        assert_eq!(staged.total_planned_secs().unwrap(), 30);
+
+        let arrival = arrival_rate_config(100.0, "45s", 50);
+        assert_eq!(arrival.total_planned_secs().unwrap(), 45);
+    }
+
+    #[test]
+    fn test_sample_staged_load_profile_config_is_valid() {
+        let config = Config::from_file(&PathBuf::from("samples/staged-load-profile.yaml")).unwrap();
+        let stages = config.parsed_stages().unwrap().unwrap();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(config.total_planned_secs().unwrap(), 30 + 120 + 30);
+    }
+
+    #[test]
+    fn test_sample_arrival_rate_profile_config_is_valid() {
+        let config =
+            Config::from_file(&PathBuf::from("samples/arrival-rate-profile.yaml")).unwrap();
+        let (target_rps, duration, max_concurrency) =
+            config.parsed_arrival_rate().unwrap().unwrap();
+        assert_eq!(target_rps, 200.0);
+        assert_eq!(duration, Duration::from_secs(300));
+        assert_eq!(max_concurrency, 500);
     }
 }
