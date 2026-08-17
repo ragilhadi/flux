@@ -74,6 +74,37 @@ struct CollectorState {
     /// Streaming sink for raw rows, dropped by `close_result_stream` so the
     /// writer task can finish.
     csv_sink: Option<UnboundedSender<RequestResult>>,
+    /// Load profile in effect, when one is configured. `None` for a plain
+    /// fixed-concurrency run.
+    load_profile: Option<LoadProfileState>,
+    /// Metadata for every load-profile stage seen so far, in order.
+    stage_meta: Vec<StageMeta>,
+    /// Aggregate observed while each stage was active, keyed by stage index.
+    per_stage: BTreeMap<usize, Aggregate>,
+    /// Index of the stage currently attributed to incoming results.
+    current_stage: Option<usize>,
+}
+
+/// Load-profile bookkeeping: what kind of profile is running and, for
+/// arrival-rate profiles, how pacing is keeping up with the target rate.
+#[derive(Debug, Clone)]
+struct LoadProfileState {
+    kind: String,
+    target_rps: Option<f64>,
+    /// Pacing ticks attempted (arrival-rate only).
+    scheduled_ticks: usize,
+    /// Pacing ticks that found every worker busy and were skipped rather
+    /// than queued, so concurrency stays bounded.
+    saturated_ticks: usize,
+}
+
+/// Metadata describing one load-profile stage, recorded when it begins.
+#[derive(Debug, Clone)]
+struct StageMeta {
+    label: String,
+    target_concurrency: Option<usize>,
+    target_rps: Option<f64>,
+    planned_duration_secs: f64,
 }
 
 /// One second of the live timeline.
@@ -153,6 +184,43 @@ pub struct MetricsSummary {
     /// statistics above still cover every request.
     #[serde(default)]
     pub dropped_results: usize,
+    /// Configured-versus-achieved load, present only when `load_profile` is
+    /// configured. Reports written before load profiles existed simply omit
+    /// this field.
+    #[serde(default)]
+    pub load_profile: Option<LoadProfileSummary>,
+    /// Per-stage breakdown for a `stages` or `arrival_rate` load profile, in
+    /// order. Empty for a plain fixed-concurrency run.
+    #[serde(default)]
+    pub stages: Vec<StageSummary>,
+}
+
+/// Configured-versus-achieved load for the whole run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadProfileSummary {
+    /// `"stages"` or `"arrival_rate"`.
+    pub kind: String,
+    /// Configured target requests per second (`arrival_rate` only).
+    pub target_rps: Option<f64>,
+    /// Measured requests per second over the run (`arrival_rate` only).
+    pub achieved_rps: Option<f64>,
+    /// Pacing ticks attempted (`arrival_rate` only).
+    pub scheduled_ticks: usize,
+    /// Pacing ticks skipped because every worker was busy, meaning the
+    /// target rate could not be sustained at that moment.
+    pub saturated_ticks: usize,
+}
+
+/// Metrics for one load-profile stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageSummary {
+    pub label: String,
+    /// Configured worker count for this stage (`stages` profile only).
+    pub target_concurrency: Option<usize>,
+    /// Configured target rate for this stage (`arrival_rate` profile only).
+    pub target_rps: Option<f64>,
+    pub planned_duration_secs: f64,
+    pub metrics: ScenarioMetricsSummary,
 }
 
 /// Summary statistics for one named scenario step.
@@ -442,6 +510,10 @@ impl MetricsCollector {
                 recent: VecDeque::new(),
                 recent_failures: VecDeque::new(),
                 csv_sink,
+                load_profile: None,
+                stage_meta: Vec::new(),
+                per_stage: BTreeMap::new(),
+                current_stage: None,
             })),
             start_time: Utc::now(),
             max_stored_results,
@@ -455,6 +527,63 @@ impl MetricsCollector {
     pub fn close_result_stream(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.csv_sink = None;
+        }
+    }
+
+    /// Declare the load profile in effect for this run. Called once, before
+    /// the first request, by a `stages` or `arrival_rate` executor path. A
+    /// plain fixed-concurrency run never calls this, so its summary carries
+    /// no `load_profile`.
+    pub fn set_load_profile(&self, kind: &str, target_rps: Option<f64>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.load_profile = Some(LoadProfileState {
+                kind: kind.to_string(),
+                target_rps,
+                scheduled_ticks: 0,
+                saturated_ticks: 0,
+            });
+        }
+    }
+
+    /// Record that a pacing tick fired for an arrival-rate profile.
+    pub fn record_scheduled_tick(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(profile) = &mut state.load_profile {
+                profile.scheduled_ticks += 1;
+            }
+        }
+    }
+
+    /// Record that a pacing tick found every worker busy and was skipped
+    /// rather than queued, so an overloaded target shows up as saturation
+    /// instead of unbounded task creation.
+    pub fn record_saturation(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(profile) = &mut state.load_profile {
+                profile.saturated_ticks += 1;
+            }
+        }
+    }
+
+    /// Begin a new load-profile stage: subsequent results are attributed to
+    /// it until the next call. Stages are reported in the order they begin.
+    pub fn begin_stage(
+        &self,
+        label: String,
+        target_concurrency: Option<usize>,
+        target_rps: Option<f64>,
+        planned_duration_secs: f64,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            let index = state.stage_meta.len();
+            state.stage_meta.push(StageMeta {
+                label,
+                target_concurrency,
+                target_rps,
+                planned_duration_secs,
+            });
+            state.per_stage.insert(index, Aggregate::new());
+            state.current_stage = Some(index);
         }
     }
 
@@ -495,6 +624,13 @@ impl MetricsCollector {
                 .observe(&result);
         }
         *state.status_codes.entry(result.status_code).or_default() += 1;
+        if let Some(stage_index) = state.current_stage {
+            state
+                .per_stage
+                .entry(stage_index)
+                .or_insert_with(Aggregate::new)
+                .observe(&result);
+        }
         state.observe_timeline(&result);
         state.observe_recent(&result);
         if state
@@ -681,6 +817,37 @@ impl MetricsCollector {
             })
             .collect();
 
+        let stages = state
+            .stage_meta
+            .iter()
+            .enumerate()
+            .map(|(index, meta)| {
+                let metrics = state
+                    .per_stage
+                    .get(&index)
+                    .map(|aggregate| aggregate.summarize_scenario(meta.planned_duration_secs))
+                    .unwrap_or_else(|| Aggregate::new().summarize_scenario(0.0));
+                StageSummary {
+                    label: meta.label.clone(),
+                    target_concurrency: meta.target_concurrency,
+                    target_rps: meta.target_rps,
+                    planned_duration_secs: meta.planned_duration_secs,
+                    metrics,
+                }
+            })
+            .collect();
+
+        let load_profile = state
+            .load_profile
+            .as_ref()
+            .map(|profile| LoadProfileSummary {
+                kind: profile.kind.clone(),
+                target_rps: profile.target_rps,
+                achieved_rps: profile.target_rps.map(|_| throughput),
+                scheduled_ticks: profile.scheduled_ticks,
+                saturated_ticks: profile.saturated_ticks,
+            });
+
         MetricsSummary {
             total_requests: total,
             successful_requests: successful,
@@ -705,6 +872,8 @@ impl MetricsCollector {
             skipped_scenarios: state.skipped_scenarios.clone(),
             retained_results: state.results.len(),
             dropped_results: state.dropped_results,
+            load_profile,
+            stages,
         }
     }
 
@@ -1123,5 +1292,82 @@ mod tests {
             rendered.contains("flux_requests_total{status=\"failure\"} 1"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn test_a_run_with_no_load_profile_omits_it_from_the_summary() {
+        let collector = MetricsCollector::new();
+        collector.record(result(None, 10, None));
+
+        let summary = collector.generate_summary();
+        assert!(summary.load_profile.is_none());
+        assert!(summary.stages.is_empty());
+    }
+
+    #[test]
+    fn test_stage_transitions_attribute_requests_to_the_active_stage() {
+        let collector = MetricsCollector::new();
+        collector.set_load_profile("stages", None);
+
+        collector.begin_stage("Stage 1".to_string(), Some(2), None, 10.0);
+        collector.record(result(None, 10, None));
+        collector.record(result(None, 20, None));
+
+        collector.begin_stage("Stage 2".to_string(), Some(5), None, 5.0);
+        collector.record(result(None, 30, Some("HTTP 500")));
+
+        let summary = collector.generate_summary();
+        assert_eq!(summary.stages.len(), 2);
+
+        assert_eq!(summary.stages[0].label, "Stage 1");
+        assert_eq!(summary.stages[0].target_concurrency, Some(2));
+        assert_eq!(summary.stages[0].planned_duration_secs, 10.0);
+        assert_eq!(summary.stages[0].metrics.total_requests, 2);
+        assert_eq!(summary.stages[0].metrics.failed_requests, 0);
+
+        assert_eq!(summary.stages[1].label, "Stage 2");
+        assert_eq!(summary.stages[1].target_concurrency, Some(5));
+        assert_eq!(summary.stages[1].metrics.total_requests, 1);
+        assert_eq!(summary.stages[1].metrics.failed_requests, 1);
+
+        // The overall run still counts every request across every stage.
+        assert_eq!(summary.total_requests, 3);
+
+        let profile = summary.load_profile.unwrap();
+        assert_eq!(profile.kind, "stages");
+        assert!(profile.target_rps.is_none());
+        assert!(profile.achieved_rps.is_none());
+    }
+
+    #[test]
+    fn test_arrival_rate_profile_reports_target_and_achieved_rate() {
+        let collector = MetricsCollector::new();
+        collector.set_load_profile("arrival_rate", Some(100.0));
+        collector.begin_stage(
+            "Arrival rate (100.00 req/s)".to_string(),
+            None,
+            Some(100.0),
+            1.0,
+        );
+
+        for _ in 0..5 {
+            collector.record_scheduled_tick();
+        }
+        collector.record_saturation();
+        collector.record_saturation();
+        collector.record(result(None, 5, None));
+        collector.record(result(None, 5, None));
+
+        let summary = collector.generate_summary();
+        let profile = summary.load_profile.unwrap();
+        assert_eq!(profile.kind, "arrival_rate");
+        assert_eq!(profile.target_rps, Some(100.0));
+        assert_eq!(profile.achieved_rps, Some(summary.throughput_rps));
+        assert_eq!(profile.scheduled_ticks, 5);
+        assert_eq!(profile.saturated_ticks, 2);
+
+        assert_eq!(summary.stages.len(), 1);
+        assert_eq!(summary.stages[0].target_rps, Some(100.0));
+        assert_eq!(summary.stages[0].metrics.total_requests, 2);
     }
 }

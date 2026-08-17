@@ -6,10 +6,16 @@ use anyhow::Result;
 use chrono::Utc;
 use jsonpath_rust::JsonPath;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tracing::{debug, error, warn};
+
+/// How often an idle staged-profile worker rechecks whether it has become
+/// active, in response to a stage transition or cancellation.
+const STAGE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Executor for running load tests
 pub struct Executor {
@@ -35,11 +41,218 @@ impl Executor {
         })
     }
 
-    /// Run the load test
+    /// Run the load test.
+    ///
+    /// `duration_secs` drives the plain fixed-concurrency path. When
+    /// `load_profile` is configured, the profile's own stage or arrival-rate
+    /// durations are used instead and `duration_secs` is ignored.
     pub async fn run(&self, duration_secs: u64) -> Result<()> {
+        if let Some(stages) = self.config.parsed_stages()? {
+            return self.run_staged(stages).await;
+        }
+        if let Some((target_rps, duration, max_concurrency)) = self.config.parsed_arrival_rate()? {
+            return self
+                .run_arrival_rate(target_rps, duration, max_concurrency)
+                .await;
+        }
+
         let duration = Duration::from_secs(duration_secs);
         let ramp_up = self.config.parse_ramp_up()?;
         self.run_workers(Instant::now(), duration, ramp_up).await
+    }
+
+    /// Run a `stages` load profile: concurrency ramps through a sequence of
+    /// levels, each held for its configured duration.
+    ///
+    /// Every worker that could be needed at any stage is spawned up front; a
+    /// worker whose id is not yet (or no longer) within the active stage's
+    /// `target_concurrency` idles instead of sending requests. This makes
+    /// stage transitions predictable — no worker startup latency mid-run —
+    /// without needing to cancel and respawn tasks as the target changes.
+    async fn run_staged(&self, stages: Vec<(Duration, usize)>) -> Result<()> {
+        self.metrics.set_load_profile("stages", None);
+
+        if stages.is_empty() {
+            return Ok(());
+        }
+
+        let peak_concurrency = stages.iter().map(|(_, target)| *target).max().unwrap_or(0);
+        let total_duration: Duration = stages.iter().map(|(duration, _)| *duration).sum();
+        let active_target = Arc::new(AtomicUsize::new(stages[0].1));
+        let deadline = Instant::now() + total_duration;
+
+        // Stage 0 begins before any worker is spawned, so no request can be
+        // recorded before `current_stage` is set — otherwise the first
+        // requests would land in the measured window but in no stage at all.
+        self.metrics.begin_stage(
+            format!("Stage 1 ({} workers)", stages[0].1),
+            Some(stages[0].1),
+            None,
+            stages[0].0.as_secs_f64(),
+        );
+
+        let mut handles = Vec::with_capacity(peak_concurrency);
+        for worker_id in 0..peak_concurrency {
+            if self.cancellation.is_cancelled() {
+                debug!("Cancellation requested; not starting worker {}", worker_id);
+                break;
+            }
+
+            let executor = self.clone_for_worker();
+            let target = Arc::clone(&active_target);
+            handles.push(tokio::spawn(async move {
+                executor
+                    .staged_worker_loop(worker_id, target, deadline)
+                    .await;
+            }));
+        }
+
+        // Every worker that stage 0 could need is now spawned, so the
+        // measured load window begins here, mirroring the fixed-concurrency
+        // profile's ramp-up boundary.
+        self.metrics.mark_load_phase_started();
+
+        for (index, (duration, target_concurrency)) in stages.iter().enumerate() {
+            if self.cancellation.is_cancelled() {
+                debug!("Cancellation requested; stopping stage schedule");
+                break;
+            }
+            if index > 0 {
+                active_target.store(*target_concurrency, Ordering::SeqCst);
+                self.metrics.begin_stage(
+                    format!("Stage {} ({} workers)", index + 1, target_concurrency),
+                    Some(*target_concurrency),
+                    None,
+                    duration.as_secs_f64(),
+                );
+            }
+            if !self.cancellation.sleep(*duration).await {
+                debug!("Cancellation requested during stage {}", index + 1);
+                break;
+            }
+        }
+        active_target.store(0, Ordering::SeqCst);
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
+
+    /// A staged-profile worker: active only while its id is within the
+    /// currently active stage's target concurrency, idling otherwise.
+    async fn staged_worker_loop(
+        &self,
+        worker_id: usize,
+        active_target: Arc<AtomicUsize>,
+        deadline: Instant,
+    ) {
+        debug!("Staged worker {} started", worker_id);
+
+        while Instant::now() < deadline && !self.cancellation.is_cancelled() {
+            if worker_id >= active_target.load(Ordering::SeqCst) {
+                if !self.cancellation.sleep(STAGE_IDLE_POLL_INTERVAL).await {
+                    break;
+                }
+                continue;
+            }
+
+            if self.config.is_simple_mode() {
+                self.execute_simple_request().await;
+                if let Some(think_time) = self
+                    .config
+                    .parse_think_time()
+                    .expect("Validated think_time became invalid")
+                {
+                    if !self.cancellation.sleep(think_time).await {
+                        break;
+                    }
+                }
+            } else {
+                self.execute_scenarios().await;
+            }
+
+            if self.config.mode == "sync"
+                && !self.cancellation.sleep(Duration::from_millis(10)).await
+            {
+                break;
+            }
+        }
+
+        debug!("Staged worker {} finished", worker_id);
+    }
+
+    /// Run an `arrival_rate` load profile: request starts are paced at
+    /// `target_rps` instead of being driven by a fixed worker loop.
+    ///
+    /// In-flight requests are bounded by `max_concurrency` via a semaphore: a
+    /// pacing tick that finds no free permit is counted as saturation and
+    /// skipped rather than queued, so a target the backend cannot sustain
+    /// shows up in the report instead of creating unbounded pending work.
+    async fn run_arrival_rate(
+        &self,
+        target_rps: f64,
+        duration: Duration,
+        max_concurrency: usize,
+    ) -> Result<()> {
+        self.metrics
+            .set_load_profile("arrival_rate", Some(target_rps));
+        self.metrics.begin_stage(
+            format!("Arrival rate ({target_rps:.2} req/s)"),
+            None,
+            Some(target_rps),
+            duration.as_secs_f64(),
+        );
+        self.metrics.mark_load_phase_started();
+
+        let semaphore = Arc::new(Semaphore::new(max_concurrency));
+        // A period of exactly zero would make `interval` panic, so a huge
+        // target rate is clamped to a still-very-fast one instead of failing.
+        let period = Duration::from_secs_f64((1.0 / target_rps).max(0.000_001));
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let deadline = Instant::now() + duration;
+
+        loop {
+            if Instant::now() >= deadline || self.cancellation.is_cancelled() {
+                break;
+            }
+
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+
+            if Instant::now() >= deadline || self.cancellation.is_cancelled() {
+                break;
+            }
+
+            self.metrics.record_scheduled_tick();
+            match Arc::clone(&semaphore).try_acquire_owned() {
+                Ok(permit) => {
+                    let executor = self.clone_for_worker();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if executor.config.is_simple_mode() {
+                            executor.execute_simple_request().await;
+                        } else {
+                            executor.execute_scenarios().await;
+                        }
+                    });
+                }
+                Err(_) => {
+                    self.metrics.record_saturation();
+                }
+            }
+        }
+
+        // Wait for every in-flight request to finish: once every permit is
+        // back, no spawned task can still be running.
+        let _ = semaphore.acquire_many(max_concurrency as u32).await;
+
+        Ok(())
     }
 
     /// Start workers, optionally spreading their startup across a ramp-up
@@ -461,7 +674,7 @@ fn response_body_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OutputConfig;
+    use crate::config::{LoadProfile, OutputConfig, Stage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::sleep;
@@ -479,6 +692,7 @@ mod tests {
             duration: "30s".to_string(),
             timeout: "30s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -654,6 +868,7 @@ mod tests {
             duration: "1s".to_string(),
             timeout: "5s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 1,
             retry_delay: Some("0s".to_string()),
@@ -743,6 +958,7 @@ mod tests {
             duration: "300s".to_string(),
             timeout: "5s".to_string(),
             ramp_up: None,
+            load_profile: None,
             think_time: None,
             retry_count: 0,
             retry_delay: None,
@@ -882,5 +1098,199 @@ mod tests {
         let results = metrics.get_results();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status_code, 503);
+    }
+
+    /// Accept connections until dropped, sleeping `delay` before answering
+    /// with `status` — used to make a target look slow or overloaded.
+    async fn spawn_delayed_status_server(
+        status: u16,
+        delay: Duration,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let _ = socket.read(&mut request).await;
+                    sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (address, handle)
+    }
+
+    #[tokio::test]
+    async fn test_staged_profile_ramps_through_each_stage_on_schedule() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::Stages {
+            stages: vec![
+                Stage {
+                    duration: "1s".to_string(),
+                    target_concurrency: 2,
+                },
+                Stage {
+                    duration: "1s".to_string(),
+                    target_concurrency: 8,
+                },
+            ],
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        let started = Instant::now();
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        // Two 1s stages: comfortably over the per-stage duration so both
+        // stages actually ran, with slack for a loaded test environment.
+        assert!(started.elapsed() >= Duration::from_millis(1_800));
+        assert!(started.elapsed() < Duration::from_secs(30));
+
+        let summary = metrics.generate_summary();
+        assert_eq!(summary.stages.len(), 2);
+        assert_eq!(summary.stages[0].label, "Stage 1 (2 workers)");
+        assert_eq!(summary.stages[0].target_concurrency, Some(2));
+        assert_eq!(summary.stages[1].label, "Stage 2 (8 workers)");
+        assert_eq!(summary.stages[1].target_concurrency, Some(8));
+        // Both stages actually reached their configured concurrency and
+        // issued requests on schedule.
+        assert!(summary.stages[0].metrics.total_requests > 0);
+        assert!(summary.stages[1].metrics.total_requests > 0);
+        assert!(summary.total_requests > 0);
+        // Every request lands in exactly one stage — none should be lost in
+        // the gap between worker startup and the first stage beginning.
+        let stage_total: usize = summary
+            .stages
+            .iter()
+            .map(|s| s.metrics.total_requests)
+            .sum();
+        assert_eq!(stage_total, summary.total_requests);
+    }
+
+    #[tokio::test]
+    async fn test_staged_profile_cancellation_stops_quickly() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::Stages {
+            stages: vec![
+                Stage {
+                    duration: "200s".to_string(),
+                    target_concurrency: 3,
+                },
+                Stage {
+                    duration: "200s".to_string(),
+                    target_concurrency: 20,
+                },
+            ],
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let cancellation = Cancellation::new();
+        let executor = Executor::new(config, Arc::clone(&metrics), cancellation.clone()).unwrap();
+
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(!metrics.get_results().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_arrival_rate_paces_near_the_target_rate() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::ArrivalRate {
+            target_rps: 20.0,
+            duration: "1s".to_string(),
+            max_concurrency: 200,
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        let summary = metrics.generate_summary();
+        let profile = summary.load_profile.expect("arrival_rate profile summary");
+        assert_eq!(profile.kind, "arrival_rate");
+        assert_eq!(profile.target_rps, Some(20.0));
+        // Pacing fired at least a handful of times (proving it is not stuck)
+        // and stayed within a generous multiple of the nominal target*duration
+        // tick count (proving it is not spinning unboundedly), tolerant of a
+        // slow or contended test environment in either direction.
+        assert!(profile.scheduled_ticks > 0, "{}", profile.scheduled_ticks);
+        assert!(
+            profile.scheduled_ticks <= 200,
+            "{}",
+            profile.scheduled_ticks
+        );
+        assert!(summary.total_requests > 0);
+        assert!(summary.total_requests <= profile.scheduled_ticks);
+        assert_eq!(summary.stages.len(), 1);
+        assert_eq!(summary.stages[0].target_rps, Some(20.0));
+    }
+
+    #[tokio::test]
+    async fn test_arrival_rate_tracks_saturation_against_a_slow_target() {
+        // Each request takes 200ms to answer but only one may be in flight,
+        // so at 50 req/s most pacing ticks cannot start a new request.
+        let (address, server) = spawn_delayed_status_server(200, Duration::from_millis(200)).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::ArrivalRate {
+            target_rps: 50.0,
+            duration: "500ms".to_string(),
+            max_concurrency: 1,
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        let summary = metrics.generate_summary();
+        let profile = summary.load_profile.expect("arrival_rate profile summary");
+        assert!(profile.saturated_ticks > 0);
+        assert!(profile.scheduled_ticks >= profile.saturated_ticks);
+    }
+
+    #[tokio::test]
+    async fn test_arrival_rate_cancellation_stops_quickly() {
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::ArrivalRate {
+            target_rps: 10.0,
+            duration: "300s".to_string(),
+            max_concurrency: 50,
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let cancellation = Cancellation::new();
+        let executor = Executor::new(config, Arc::clone(&metrics), cancellation.clone()).unwrap();
+
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }

@@ -1,0 +1,21 @@
+# Arrival-rate load profile: pace request starts at a fixed target rate
+# instead of driving a fixed worker count. Useful for testing whether a
+# system can sustain a specific requests-per-second target rather than an
+# unconstrained worker loop.
+target: "https://jsonplaceholder.typicode.com/posts/1"
+method: "GET"
+
+headers:
+  Accept: "application/json"
+
+load_profile:
+  type: arrival_rate
+  target_rps: 200
+  duration: "5m"
+  max_concurrency: 500
+
+mode: "async"
+
+output:
+  json: "/app/results/arrival-rate-profile.json"
+  html: "/app/results/arrival-rate-profile.html"
