@@ -409,6 +409,7 @@ async fn main() -> Result<()> {
     // Generate summary
     info!("Generating summary");
     let summary = metrics.generate_summary();
+    let csv_dropped_rows = summary.csv_dropped_rows;
     let results = metrics.get_results();
     let assertion_failures = config.evaluate_assertions(&summary);
 
@@ -441,7 +442,13 @@ async fn main() -> Result<()> {
         metrics.close_result_stream();
         match stream.finish().await {
             Ok(rows) => {
-                ui.display_success(&format!("CSV report saved to: {csv_path} ({rows} rows)"))
+                ui.display_success(&format!("CSV report saved to: {csv_path} ({rows} rows)"));
+                if csv_dropped_rows > 0 {
+                    ui.display_warning(&format!(
+                        "{csv_dropped_rows} row(s) were dropped from the CSV output because \
+                         the writer fell behind; JSON/HTML statistics still cover every request"
+                    ));
+                }
             }
             Err(e) => error!("Failed to generate CSV report: {}", e),
         }

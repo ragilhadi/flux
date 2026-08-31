@@ -3,7 +3,7 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::warn;
 
 /// Upper bound of the latency histogram, in milliseconds.
@@ -72,8 +72,15 @@ struct CollectorState {
     /// Most recent failures, bounded to `RECENT_SAMPLE_SIZE`.
     recent_failures: VecDeque<RecentResult>,
     /// Streaming sink for raw rows, dropped by `close_result_stream` so the
-    /// writer task can finish.
-    csv_sink: Option<UnboundedSender<RequestResult>>,
+    /// writer task can finish. Bounded so a writer that falls behind (a slow
+    /// disk, backpressure) cannot buffer unboundedly many rows in memory; a
+    /// row that does not fit is dropped and counted in `csv_dropped_rows`
+    /// rather than queued.
+    csv_sink: Option<Sender<RequestResult>>,
+    /// Rows that could not be forwarded to the CSV sink because the channel
+    /// was full or the writer had already stopped (for example, after a
+    /// disk write failure).
+    csv_dropped_rows: usize,
     /// Load profile in effect, when one is configured. `None` for a plain
     /// fixed-concurrency run.
     load_profile: Option<LoadProfileState>,
@@ -105,6 +112,9 @@ struct StageMeta {
     target_concurrency: Option<usize>,
     target_rps: Option<f64>,
     planned_duration_secs: f64,
+    /// When this stage actually began, used to compute how long it actually
+    /// ran rather than assuming it got the full planned duration.
+    started_at: DateTime<Utc>,
 }
 
 /// One second of the live timeline.
@@ -184,6 +194,12 @@ pub struct MetricsSummary {
     /// statistics above still cover every request.
     #[serde(default)]
     pub dropped_results: usize,
+    /// Rows that could not be written to the CSV output because the writer
+    /// fell behind (or stopped, for example after a disk error) and the
+    /// bounded queue between it and the collector was full. `0` when no CSV
+    /// output is configured.
+    #[serde(default)]
+    pub csv_dropped_rows: usize,
     /// Configured-versus-achieved load, present only when `load_profile` is
     /// configured. Reports written before load profiles existed simply omit
     /// this field.
@@ -220,6 +236,13 @@ pub struct StageSummary {
     /// Configured target rate for this stage (`arrival_rate` profile only).
     pub target_rps: Option<f64>,
     pub planned_duration_secs: f64,
+    /// Wall-clock time the stage was actually active: from when it began to
+    /// when the next stage began, or to the end of the run for the last
+    /// stage. Throughput is computed against this, not the planned duration,
+    /// so a stage cut short by cancellation — or delayed by slow worker
+    /// startup — reports the rate it actually achieved.
+    #[serde(default)]
+    pub observed_duration_secs: f64,
     pub metrics: ScenarioMetricsSummary,
 }
 
@@ -495,7 +518,7 @@ impl MetricsCollector {
     /// to a streaming sink, such as the CSV writer.
     pub fn with_retention(
         max_stored_results: usize,
-        csv_sink: Option<UnboundedSender<RequestResult>>,
+        csv_sink: Option<Sender<RequestResult>>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(CollectorState {
@@ -510,6 +533,7 @@ impl MetricsCollector {
                 recent: VecDeque::new(),
                 recent_failures: VecDeque::new(),
                 csv_sink,
+                csv_dropped_rows: 0,
                 load_profile: None,
                 stage_meta: Vec::new(),
                 per_stage: BTreeMap::new(),
@@ -581,6 +605,7 @@ impl MetricsCollector {
                 target_concurrency,
                 target_rps,
                 planned_duration_secs,
+                started_at: Utc::now(),
             });
             state.per_stage.insert(index, Aggregate::new());
             state.current_stage = Some(index);
@@ -610,9 +635,13 @@ impl MetricsCollector {
         };
 
         // Streamed output receives every row, including rows that are not
-        // retained in memory.
+        // retained in memory. The channel is bounded: a writer that falls
+        // behind drops the row rather than buffering unboundedly many of
+        // them, and the drop is counted so the report can say so.
         if let Some(sink) = &state.csv_sink {
-            let _ = sink.send(result.clone());
+            if sink.try_send(result.clone()).is_err() {
+                state.csv_dropped_rows += 1;
+            }
         }
 
         state.aggregate.observe(&result);
@@ -769,8 +798,17 @@ impl MetricsCollector {
     }
 
     /// Generate final summary
+    ///
+    /// Recovers a poisoned lock rather than panicking: this runs after the
+    /// load test has finished, so a panic here would discard the results of
+    /// a completed run — the single most expensive place for that to happen.
+    /// The recovered state is whatever the last observation left behind,
+    /// which is still the best summary available.
     pub fn generate_summary(&self) -> MetricsSummary {
-        let state = self.state.lock().expect("metrics state poisoned");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let total = state.aggregate.total;
         let failed = state.aggregate.failed;
@@ -822,16 +860,32 @@ impl MetricsCollector {
             .iter()
             .enumerate()
             .map(|(index, meta)| {
+                // A stage runs from when it began to when the next stage
+                // began, or to the end of the run for the last stage — never
+                // the planned duration, which a cancelled or slow-starting
+                // stage would not actually have gotten.
+                let stage_end = state
+                    .stage_meta
+                    .get(index + 1)
+                    .map(|next| next.started_at)
+                    .unwrap_or(end_time);
+                let observed_duration_secs = stage_end
+                    .signed_duration_since(meta.started_at)
+                    .num_milliseconds() as f64
+                    / 1000.0;
+                let observed_duration_secs = observed_duration_secs.max(0.0);
+
                 let metrics = state
                     .per_stage
                     .get(&index)
-                    .map(|aggregate| aggregate.summarize_scenario(meta.planned_duration_secs))
+                    .map(|aggregate| aggregate.summarize_scenario(observed_duration_secs))
                     .unwrap_or_else(|| Aggregate::new().summarize_scenario(0.0));
                 StageSummary {
                     label: meta.label.clone(),
                     target_concurrency: meta.target_concurrency,
                     target_rps: meta.target_rps,
                     planned_duration_secs: meta.planned_duration_secs,
+                    observed_duration_secs,
                     metrics,
                 }
             })
@@ -872,6 +926,7 @@ impl MetricsCollector {
             skipped_scenarios: state.skipped_scenarios.clone(),
             retained_results: state.results.len(),
             dropped_results: state.dropped_results,
+            csv_dropped_rows: state.csv_dropped_rows,
             load_profile,
             stages,
         }
@@ -1082,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_results_are_forwarded_to_the_streaming_sink() {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
         let collector = MetricsCollector::with_retention(1, Some(sender));
 
         for index in 0..5 {
@@ -1102,7 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_closing_the_stream_ends_it_while_the_collector_is_alive() {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
         let collector = MetricsCollector::with_retention(0, Some(sender));
 
         collector.record(result(None, 10, None));
@@ -1120,6 +1175,21 @@ mod tests {
         // is what lets the CSV writer flush and finish.
         assert_eq!(streamed, 2);
         assert_eq!(collector.generate_summary().total_requests, 3);
+    }
+
+    #[test]
+    fn test_csv_sink_drops_and_counts_rows_when_the_writer_falls_behind() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let collector = MetricsCollector::with_retention(0, Some(sender));
+
+        // Nothing ever drains the channel, so only the first row fits.
+        for index in 0..5 {
+            collector.record(result(None, index + 1, None));
+        }
+
+        let summary = collector.generate_summary();
+        assert_eq!(summary.total_requests, 5, "statistics still cover every request");
+        assert_eq!(summary.csv_dropped_rows, 4);
     }
 
     #[test]

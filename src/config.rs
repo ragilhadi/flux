@@ -1400,6 +1400,7 @@ output:
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };

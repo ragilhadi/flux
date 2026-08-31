@@ -7,7 +7,7 @@ use chrono::Utc;
 use jsonpath_rust::JsonPath;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
@@ -79,7 +79,12 @@ impl Executor {
         let peak_concurrency = stages.iter().map(|(_, target)| *target).max().unwrap_or(0);
         let total_duration: Duration = stages.iter().map(|(duration, _)| *duration).sum();
         let active_target = Arc::new(AtomicUsize::new(stages[0].1));
-        let deadline = Instant::now() + total_duration;
+        // The deadline cannot be fixed until every worker has actually been
+        // spawned — computing it up front and handing it to workers as they
+        // spawn would charge spawn time (client construction used to make
+        // this seconds, not spawning itself) against the configured stage
+        // durations. Workers wait on this cell instead of a plain `Instant`.
+        let deadline_cell: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
 
         // Stage 0 begins before any worker is spawned, so no request can be
         // recorded before `current_stage` is set — otherwise the first
@@ -100,17 +105,20 @@ impl Executor {
 
             let executor = self.clone_for_worker();
             let target = Arc::clone(&active_target);
+            let deadline_cell = Arc::clone(&deadline_cell);
             handles.push(tokio::spawn(async move {
                 executor
-                    .staged_worker_loop(worker_id, target, deadline)
+                    .staged_worker_loop(worker_id, target, deadline_cell)
                     .await;
             }));
         }
 
         // Every worker that stage 0 could need is now spawned, so the
-        // measured load window begins here, mirroring the fixed-concurrency
-        // profile's ramp-up boundary.
+        // measured load window — and the deadline every worker waits on —
+        // start here, mirroring the fixed-concurrency profile's ramp-up
+        // boundary.
         self.metrics.mark_load_phase_started();
+        let _ = deadline_cell.set(Instant::now() + total_duration);
 
         for (index, (duration, target_concurrency)) in stages.iter().enumerate() {
             if self.cancellation.is_cancelled() {
@@ -146,9 +154,25 @@ impl Executor {
         &self,
         worker_id: usize,
         active_target: Arc<AtomicUsize>,
-        deadline: Instant,
+        deadline_cell: Arc<OnceLock<Instant>>,
     ) {
         debug!("Staged worker {} started", worker_id);
+
+        // Wait for the run to actually start: the deadline is not set until
+        // every worker this stage could need has been spawned.
+        while deadline_cell.get().is_none() {
+            if self.cancellation.is_cancelled() {
+                debug!(
+                    "Staged worker {} cancelled before the run started",
+                    worker_id
+                );
+                return;
+            }
+            if !self.cancellation.sleep(STAGE_IDLE_POLL_INTERVAL).await {
+                return;
+            }
+        }
+        let deadline = *deadline_cell.get().expect("checked above");
 
         while Instant::now() < deadline && !self.cancellation.is_cancelled() {
             if worker_id >= active_target.load(Ordering::SeqCst) {
@@ -566,33 +590,41 @@ impl Executor {
     }
 
     /// Extract variables from response body using JSONPath
+    ///
+    /// The body is parsed once and reused for every `extract` entry, rather
+    /// than once per variable: a scenario extracting several variables from
+    /// a large body used to pay for a full re-parse of it per variable, on
+    /// the hot path.
     fn extract_variables(
         &self,
         body: &str,
         scenario: &Scenario,
         variables: &mut HashMap<String, String>,
     ) {
+        let json: serde_json::Value = match serde_json::from_str(body) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Failed to parse JSON response: {}", e);
+                return;
+            }
+        };
+
         for (var_name, json_path) in &scenario.extract {
-            match serde_json::from_str::<serde_json::Value>(body) {
-                Ok(json) => match json.query(json_path) {
-                    Ok(results) => {
-                        if let Some(value) = results.first() {
-                            let extracted = match value {
-                                serde_json::Value::String(s) => s.clone(),
-                                serde_json::Value::Number(n) => n.to_string(),
-                                serde_json::Value::Bool(b) => b.to_string(),
-                                _ => value.to_string(),
-                            };
-                            debug!("Extracted variable '{}' = '{}'", var_name, extracted);
-                            variables.insert(var_name.clone(), extracted);
-                        }
+            match json.query(json_path) {
+                Ok(results) => {
+                    if let Some(value) = results.first() {
+                        let extracted = match value {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            _ => value.to_string(),
+                        };
+                        debug!("Extracted variable '{}' = '{}'", var_name, extracted);
+                        variables.insert(var_name.clone(), extracted);
                     }
-                    Err(e) => {
-                        warn!("JSONPath error for '{}': {}", json_path, e);
-                    }
-                },
+                }
                 Err(e) => {
-                    warn!("Failed to parse JSON response: {}", e);
+                    warn!("JSONPath error for '{}': {}", json_path, e);
                 }
             }
         }
@@ -603,12 +635,18 @@ impl Executor {
         executed.contains(scenario_name)
     }
 
-    /// Clone executor for worker
+    /// Clone executor for worker.
+    ///
+    /// Shares `self.client` rather than building a new one: `HttpClient` is
+    /// `Arc`-backed, so every worker reuses the same connection pool instead
+    /// of opening its own. Building a fresh client per worker (or, worse, per
+    /// request in `run_arrival_rate`) was measured at several milliseconds
+    /// each — enough to silently steal from a staged profile's stage
+    /// durations and to cap arrival-rate pacing well below its target.
     fn clone_for_worker(&self) -> Self {
         Self {
             config: self.config.clone(),
-            client: HttpClient::new(self.config.parse_timeout().expect("Invalid timeout"))
-                .expect("Failed to create client"),
+            client: self.client.clone(),
             metrics: Arc::clone(&self.metrics),
             cancellation: self.cancellation.clone(),
         }
@@ -1177,6 +1215,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_staged_profile_with_high_peak_concurrency_does_not_lose_a_stage() {
+        // A high peak concurrency used to make worker startup itself (client
+        // construction per worker, previously) eat into the deadline
+        // computed before spawning began, sometimes leaving a later stage no
+        // time to run at all. With workers spawned before the deadline is
+        // fixed, every stage should still get its planned share of the run.
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::Stages {
+            stages: vec![
+                Stage {
+                    duration: "400ms".to_string(),
+                    target_concurrency: 50,
+                },
+                Stage {
+                    duration: "400ms".to_string(),
+                    target_concurrency: 300,
+                },
+                Stage {
+                    duration: "400ms".to_string(),
+                    target_concurrency: 100,
+                },
+            ],
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        let started = Instant::now();
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        // Three 400ms stages: comfortably bounded even with scheduler slack.
+        // A regression that charged spawn time to the deadline used to blow
+        // this well past a few seconds.
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let summary = metrics.generate_summary();
+        assert_eq!(summary.stages.len(), 3);
+        for stage in &summary.stages {
+            assert!(
+                stage.metrics.total_requests > 0,
+                "stage '{}' recorded no requests",
+                stage.label
+            );
+            // Each stage's observed duration should be in the right ballpark
+            // of its planned one, not near-zero (starved) or the sum of every
+            // stage (a stalled schedule).
+            assert!(
+                stage.observed_duration_secs > 0.1 && stage.observed_duration_secs < 2.0,
+                "stage '{}' observed duration {} looks wrong",
+                stage.label,
+                stage.observed_duration_secs
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_staged_profile_cancellation_stops_quickly() {
         let (address, server) = spawn_status_server(200).await;
         let mut config = cancellation_test_config(format!("http://{address}"));
@@ -1243,6 +1338,39 @@ mod tests {
         assert!(summary.total_requests <= profile.scheduled_ticks);
         assert_eq!(summary.stages.len(), 1);
         assert_eq!(summary.stages[0].target_rps, Some(20.0));
+    }
+
+    #[tokio::test]
+    async fn test_arrival_rate_pacing_is_not_bottlenecked_by_per_tick_setup() {
+        // Building an HTTP client per pacing tick used to cost several
+        // milliseconds each — comparable to or larger than the tick period
+        // itself at a moderate target rate — and silently capped the
+        // achieved rate well below what was configured. With a shared
+        // client, pacing should keep up with a rate the local loopback
+        // server can easily sustain.
+        let (address, server) = spawn_status_server(200).await;
+        let mut config = cancellation_test_config(format!("http://{address}"));
+        config.load_profile = Some(LoadProfile::ArrivalRate {
+            target_rps: 150.0,
+            duration: "1s".to_string(),
+            max_concurrency: 200,
+        });
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        executor.run(0).await.unwrap();
+        server.abort();
+
+        let summary = metrics.generate_summary();
+        let profile = summary.load_profile.expect("arrival_rate profile summary");
+        // Nominal tick count for 150 req/s over 1s is 150; tolerant of a
+        // loaded CI environment, but nowhere near the ~40% a per-tick client
+        // build used to cap this at.
+        assert!(
+            profile.scheduled_ticks >= 100,
+            "only {} of ~150 ticks fired; pacing is bottlenecked",
+            profile.scheduled_ticks
+        );
     }
 
     #[tokio::test]

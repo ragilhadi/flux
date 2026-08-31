@@ -432,6 +432,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -481,6 +482,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: Some(LoadProfileSummary {
                 kind: "arrival_rate".to_string(),
                 target_rps: Some(50.0),
@@ -493,6 +495,7 @@ mod tests {
                 target_concurrency: None,
                 target_rps: Some(50.0),
                 planned_duration_secs: 10.0,
+                observed_duration_secs: 10.0,
                 metrics: stage_metrics,
             }],
         };
