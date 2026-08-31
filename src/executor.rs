@@ -2,6 +2,7 @@ use crate::cancel::Cancellation;
 use crate::client::HttpClient;
 use crate::config::{Config, ResponseAssertions, Scenario};
 use crate::metrics::{MetricsCollector, RequestResult};
+use crate::redact::Redactor;
 use anyhow::Result;
 use chrono::Utc;
 use jsonpath_rust::JsonPath;
@@ -23,6 +24,7 @@ pub struct Executor {
     client: HttpClient,
     metrics: Arc<MetricsCollector>,
     cancellation: Cancellation,
+    redactor: Redactor,
 }
 
 impl Executor {
@@ -33,11 +35,13 @@ impl Executor {
         cancellation: Cancellation,
     ) -> Result<Self> {
         let client = HttpClient::new(config.parse_timeout()?)?;
+        let redactor = Redactor::from_config(&config);
         Ok(Self {
             config,
             client,
             metrics,
             cancellation,
+            redactor,
         })
     }
 
@@ -435,7 +439,7 @@ impl Executor {
             }
         };
 
-        self.metrics.record(request_result);
+        self.record_result(request_result);
     }
 
     /// Execute all scenarios in sequence
@@ -559,7 +563,7 @@ impl Executor {
                         request_end_timestamp: end_time,
                     };
 
-                    self.metrics.record(request_result);
+                    self.record_result(request_result);
                 }
                 Err(e) => {
                     error!("Scenario '{}' failed: {}", scenario.name, e);
@@ -573,7 +577,7 @@ impl Executor {
                         request_end_timestamp: end_time,
                     };
 
-                    self.metrics.record(request_result);
+                    self.record_result(request_result);
                 }
             }
 
@@ -649,7 +653,20 @@ impl Executor {
             client: self.client.clone(),
             metrics: Arc::clone(&self.metrics),
             cancellation: self.cancellation.clone(),
+            redactor: self.redactor.clone(),
         }
+    }
+
+    /// Record a result, redacting its error string first.
+    ///
+    /// A request error can quote the full request URL — including any
+    /// extracted token in a query string, which the config-derived literals
+    /// alone would not catch — so every result is redacted the same way
+    /// before it reaches the collector, rather than only when a report or
+    /// the dashboard later reads it back.
+    fn record_result(&self, mut result: RequestResult) {
+        result.error = self.redactor.redact_optional(result.error.as_deref());
+        self.metrics.record(result);
     }
 }
 
@@ -1012,6 +1029,41 @@ mod tests {
                 max_results: 0,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn test_recorded_errors_are_redacted_before_reaching_the_collector() {
+        // A connection failure's error text quotes the request URL. A secret
+        // header value embedded in that URL used to reach the JSON/CSV
+        // reports verbatim, because redaction was only ever applied when the
+        // dashboard read results back — never when they were recorded.
+        const SECRET: &str = "MySecretHeaderValueXYZ";
+        let mut config = cancellation_test_config("http://127.0.0.1:1".to_string());
+        config.target = None;
+        config.scenarios = vec![Scenario {
+            name: "call".to_string(),
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:1/path?tag={SECRET}"),
+            headers: HashMap::from([("Authorization".to_string(), SECRET.to_string())]),
+            body: None,
+            multipart: None,
+            extract: HashMap::new(),
+            depends_on: None,
+            think_time: None,
+            retry_count: None,
+            retry_delay: None,
+            retry_on_status: None,
+            assertions: None,
+        }];
+        let metrics = Arc::new(MetricsCollector::new());
+        let executor = Executor::new(config, Arc::clone(&metrics), Cancellation::new()).unwrap();
+
+        executor.execute_scenarios().await;
+
+        let results = metrics.get_results();
+        assert_eq!(results.len(), 1);
+        let error = results[0].error.as_deref().expect("connection should fail");
+        assert!(!error.contains(SECRET), "secret leaked into report: {error}");
     }
 
     #[tokio::test]
