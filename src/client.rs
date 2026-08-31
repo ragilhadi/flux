@@ -123,7 +123,11 @@ impl HttpClient {
         // Add headers with variable substitution
         for (key, value) in &scenario.headers {
             let substituted_value = self.substitute_variables(value, variables);
-            check_unresolved(&format!("header '{key}'"), &substituted_value, &scenario.name)?;
+            check_unresolved(
+                &format!("header '{key}'"),
+                &substituted_value,
+                &scenario.name,
+            )?;
             request = request.header(key, substituted_value);
         }
 
@@ -250,7 +254,11 @@ impl HttpClient {
     /// untouched. Without this, a value containing `&`, `?`, `#` or a space —
     /// entirely plausible for a value extracted from a response — corrupts
     /// the request's path or query structure instead of being sent as data.
-    fn substitute_url_variables(&self, template: &str, variables: &HashMap<String, String>) -> String {
+    fn substitute_url_variables(
+        &self,
+        template: &str,
+        variables: &HashMap<String, String>,
+    ) -> String {
         substitute_placeholders(template, variables, |value| {
             percent_encoding::utf8_percent_encode(value, URL_VALUE_ENCODE_SET).to_string()
         })
@@ -563,10 +571,7 @@ mod tests {
     #[test]
     fn test_url_substitution_percent_encodes_inserted_values_only() {
         let client = HttpClient::default();
-        let vars = HashMap::from([(
-            "query".to_string(),
-            "a&b=c?d#e space".to_string(),
-        )]);
+        let vars = HashMap::from([("query".to_string(), "a&b=c?d#e space".to_string())]);
 
         let result = client.substitute_url_variables("/search?q={{ query }}&limit=10", &vars);
 
@@ -578,7 +583,8 @@ mod tests {
         let client = HttpClient::default();
         let vars = HashMap::from([("id".to_string(), "42".to_string())]);
 
-        let result = client.substitute_url_variables("https://api.example.com/users/{{ id }}?x=1&y=2", &vars);
+        let result = client
+            .substitute_url_variables("https://api.example.com/users/{{ id }}?x=1&y=2", &vars);
 
         assert_eq!(result, "https://api.example.com/users/42?x=1&y=2");
     }
@@ -679,7 +685,11 @@ mod tests {
             let server = tokio::spawn(capture_one_request(listener));
 
             let response = client
-                .execute_scenario(Some(&format!("http://{address}")), &scenario, &HashMap::new())
+                .execute_scenario(
+                    Some(&format!("http://{address}")),
+                    &scenario,
+                    &HashMap::new(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status().as_u16(), 200);
@@ -694,7 +704,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(capture_one_request(listener));
         let response = client
-            .execute_scenario(Some(&format!("http://{address}")), &scenario, &HashMap::new())
+            .execute_scenario(
+                Some(&format!("http://{address}")),
+                &scenario,
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), 200);

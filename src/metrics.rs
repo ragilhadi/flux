@@ -699,11 +699,10 @@ impl MetricsCollector {
         }
 
         let elapsed = self.elapsed_secs();
-        let current_rps = if elapsed > 0.0 {
-            total as f64 / elapsed
-        } else {
-            0.0
-        };
+        // The same windowed rate the live dashboard uses, rather than the
+        // whole-run average: during a ramp or a stage transition, an average
+        // lags well behind what is actually happening right now.
+        let current_rps = state.current_rps(Utc::now().timestamp(), elapsed);
 
         LiveMetrics {
             current_rps,
@@ -1188,7 +1187,10 @@ mod tests {
         }
 
         let summary = collector.generate_summary();
-        assert_eq!(summary.total_requests, 5, "statistics still cover every request");
+        assert_eq!(
+            summary.total_requests, 5,
+            "statistics still cover every request"
+        );
         assert_eq!(summary.csv_dropped_rows, 4);
     }
 
@@ -1318,6 +1320,35 @@ mod tests {
         assert_eq!(snapshot.current_rps, 0.0);
         // The all-run average still counts them.
         assert_eq!(snapshot.total_requests, 10);
+    }
+
+    #[test]
+    fn test_live_metrics_use_the_windowed_rate_not_the_whole_run_average() {
+        // get_live_metrics() used to divide the total count by the whole
+        // elapsed time, the same average snapshot()'s current_rps
+        // deliberately avoids, which made the terminal's live RPS lag well
+        // behind reality during a ramp or a stage transition.
+        let collector = MetricsCollector::new();
+        let now = Utc::now();
+
+        for _ in 0..10 {
+            let timestamp = now - chrono::Duration::seconds(60);
+            collector.record(RequestResult {
+                scenario_name: None,
+                latency_ms: 5,
+                status_code: 200,
+                error: None,
+                request_start_timestamp: timestamp,
+                request_end_timestamp: timestamp,
+            });
+        }
+
+        let live = collector.get_live_metrics();
+        assert_eq!(live.total_requests, 10);
+        assert_eq!(
+            live.current_rps, 0.0,
+            "a minute-old burst is not \"current\""
+        );
     }
 
     #[test]

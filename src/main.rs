@@ -323,7 +323,15 @@ async fn main() -> Result<()> {
     };
 
     let prometheus_server = match config.prometheus_port {
-        Some(port) => match PrometheusServer::start(port, Arc::clone(&metrics)).await {
+        Some(port) => match PrometheusServer::start(
+            config
+                .parse_prometheus_bind()
+                .expect("validated at config load"),
+            port,
+            Arc::clone(&metrics),
+        )
+        .await
+        {
             Ok(server) => {
                 info!(
                     "Prometheus metrics available at http://{}/metrics",

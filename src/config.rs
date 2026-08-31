@@ -79,6 +79,14 @@ pub struct Config {
     #[serde(default)]
     pub prometheus_port: Option<u16>,
 
+    /// Address the Prometheus endpoint binds to.
+    ///
+    /// The endpoint exposes run metrics over plain HTTP with no
+    /// authentication, so it defaults to loopback; binding anything else is
+    /// opt-in, same as `live_dashboard.bind`.
+    #[serde(default = "default_prometheus_bind")]
+    pub prometheus_bind: String,
+
     /// Optional live web dashboard for the running test.
     ///
     /// Absent by default: no socket is opened unless this section exists.
@@ -311,6 +319,10 @@ fn default_dashboard_bind() -> String {
     "127.0.0.1:9090".to_string()
 }
 
+fn default_prometheus_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_dashboard_refresh_ms() -> u64 {
     1_000
 }
@@ -354,6 +366,7 @@ impl Config {
         if self.prometheus_port == Some(0) {
             anyhow::bail!("prometheus_port must be greater than 0");
         }
+        self.parse_prometheus_bind()?;
         if let Some(dashboard) = &self.live_dashboard {
             let address = dashboard.parse_bind()?;
             if address.port() == 0 {
@@ -614,6 +627,20 @@ impl Config {
         parse_duration(&self.timeout)
     }
 
+    /// Parse the configured Prometheus bind address.
+    pub fn parse_prometheus_bind(&self) -> anyhow::Result<std::net::IpAddr> {
+        self.prometheus_bind
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid prometheus_bind '{}'; expected an address such as \
+                 '127.0.0.1' or '0.0.0.0'",
+                    self.prometheus_bind
+                )
+            })
+    }
+
     /// Parse the optional worker ramp-up duration.
     pub fn parse_ramp_up(&self) -> anyhow::Result<Option<Duration>> {
         parse_optional_duration(self.ramp_up.as_deref())
@@ -740,6 +767,7 @@ impl Config {
         self.duration = expand_environment_value(&self.duration)?;
         self.timeout = expand_environment_value(&self.timeout)?;
         self.ramp_up = expand_optional(self.ramp_up.take())?;
+        self.prometheus_bind = expand_environment_value(&self.prometheus_bind)?;
         if let Some(profile) = &mut self.load_profile {
             match profile {
                 LoadProfile::Stages { stages } => {
@@ -935,6 +963,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -980,6 +1009,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1028,6 +1058,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1075,6 +1106,7 @@ mod tests {
             retry_on_status: vec![503],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1143,6 +1175,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1257,6 +1290,21 @@ output:
     }
 
     #[test]
+    fn test_prometheus_bind_defaults_to_loopback_and_rejects_garbage() {
+        let config = scenario_config(vec![]);
+        assert_eq!(config.prometheus_bind, "127.0.0.1");
+        assert_eq!(
+            config.parse_prometheus_bind().unwrap(),
+            std::net::IpAddr::from([127, 0, 0, 1])
+        );
+
+        let mut config = config;
+        config.prometheus_bind = "not-an-ip".to_string();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Invalid prometheus_bind"), "{error}");
+    }
+
+    #[test]
     fn test_valid_dependency_chain_is_accepted() {
         let config = scenario_config(vec![
             scenario("login", None),
@@ -1367,6 +1415,7 @@ output:
                 max_avg_ms: Some(200.0),
             }),
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {

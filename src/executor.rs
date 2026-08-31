@@ -754,6 +754,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -930,6 +931,7 @@ mod tests {
             retry_on_status: vec![503],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1020,6 +1022,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1063,7 +1066,10 @@ mod tests {
         let results = metrics.get_results();
         assert_eq!(results.len(), 1);
         let error = results[0].error.as_deref().expect("connection should fail");
-        assert!(!error.contains(SECRET), "secret leaked into report: {error}");
+        assert!(
+            !error.contains(SECRET),
+            "secret leaked into report: {error}"
+        );
     }
 
     #[tokio::test]

@@ -300,6 +300,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
