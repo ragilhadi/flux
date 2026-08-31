@@ -106,6 +106,14 @@ Set `prometheus_port` to expose metrics while a test is running. Omit it to disa
 prometheus_port: 9090
 ```
 
+The endpoint has no authentication, so it binds to loopback (`127.0.0.1`) by
+default. Set `prometheus_bind` to reach it from elsewhere:
+
+```yaml
+prometheus_port: 9090
+prometheus_bind: "0.0.0.0" # reachable beyond this host; restrict access at the network level
+```
+
 Scrape `http://localhost:9090/metrics` for success and failure counters, latency
 quantiles, and the current request rate:
 
@@ -403,6 +411,7 @@ pacing work, and what shows up in the reports.
 | `retry_on_status` | array | No | [] | HTTP status codes eligible for retry |
 | `assertions` | object | No | - | Aggregate error-rate and latency quality gates |
 | `prometheus_port` | integer | No | - | Port for the live Prometheus metrics endpoint |
+| `prometheus_bind` | string | No | 127.0.0.1 | Address the Prometheus endpoint binds to |
 | `live_dashboard` | object | No | - | Live web dashboard; no port is opened unless set |
 | `mode` | string | No | async | Execution mode: "async" or "sync" |
 | `output` | object | Yes | - | Output configuration |

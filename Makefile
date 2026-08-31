@@ -38,7 +38,7 @@ help:
 # Development
 dev:
 	@echo "Running Flux in development mode..."
-	RUST_LOG=debug cargo run -- config.yaml
+	RUST_LOG=debug cargo run -- --config config.yaml
 
 check:
 	@echo "Running quick compile check..."
@@ -113,6 +113,5 @@ clean:
 	cargo clean
 
 clean-all: clean
-	@echo "Deep cleaning (including dependencies cache)..."
+	@echo "Deep cleaning (including build cache)..."
 	rm -rf target/
-	rm -rf Cargo.lock
