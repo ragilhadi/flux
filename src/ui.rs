@@ -83,8 +83,9 @@ impl TerminalUI {
         }
         if let Some(port) = config.prometheus_port {
             println!(
-                "{:<20} : http://0.0.0.0:{}/metrics",
+                "{:<20} : http://{}:{}/metrics",
                 "Prometheus".bright_yellow(),
+                config.prometheus_bind,
                 port
             );
         }
@@ -361,6 +362,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -432,6 +434,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -481,6 +484,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: Some(LoadProfileSummary {
                 kind: "arrival_rate".to_string(),
                 target_rps: Some(50.0),
@@ -493,6 +497,7 @@ mod tests {
                 target_concurrency: None,
                 target_rps: Some(50.0),
                 planned_duration_secs: 10.0,
+                observed_duration_secs: 10.0,
                 metrics: stage_metrics,
             }],
         };

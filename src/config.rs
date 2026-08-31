@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing::warn;
 
 /// Main configuration structure for Flux load testing
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,6 +79,14 @@ pub struct Config {
     /// Optional port for the live Prometheus metrics endpoint
     #[serde(default)]
     pub prometheus_port: Option<u16>,
+
+    /// Address the Prometheus endpoint binds to.
+    ///
+    /// The endpoint exposes run metrics over plain HTTP with no
+    /// authentication, so it defaults to loopback; binding anything else is
+    /// opt-in, same as `live_dashboard.bind`.
+    #[serde(default = "default_prometheus_bind")]
+    pub prometheus_bind: String,
 
     /// Optional live web dashboard for the running test.
     ///
@@ -311,6 +320,10 @@ fn default_dashboard_bind() -> String {
     "127.0.0.1:9090".to_string()
 }
 
+fn default_prometheus_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_dashboard_refresh_ms() -> u64 {
     1_000
 }
@@ -354,6 +367,7 @@ impl Config {
         if self.prometheus_port == Some(0) {
             anyhow::bail!("prometheus_port must be greater than 0");
         }
+        self.parse_prometheus_bind()?;
         if let Some(dashboard) = &self.live_dashboard {
             let address = dashboard.parse_bind()?;
             if address.port() == 0 {
@@ -526,12 +540,28 @@ impl Config {
                 if stages.is_empty() {
                     anyhow::bail!("load_profile.stages must contain at least one stage");
                 }
+                if stages.iter().all(|stage| stage.target_concurrency == 0) {
+                    anyhow::bail!(
+                        "load_profile.stages has every stage at target_concurrency: 0; \
+                         the run would send no requests"
+                    );
+                }
                 for (index, stage) in stages.iter().enumerate() {
                     // `parse_duration` itself rejects a zero duration, so
                     // stages can never be given a no-op hold time.
                     parse_duration(&stage.duration).map_err(|e| {
                         anyhow::anyhow!("Invalid duration for stage {}: {e}", index + 1)
                     })?;
+                    // A single zero-concurrency stage is a legitimate
+                    // ramp-down (see samples/staged-load-profile.yaml), so it
+                    // is only worth a warning, not a hard error.
+                    if stage.target_concurrency == 0 {
+                        warn!(
+                            "load_profile stage {} has target_concurrency: 0; \
+                             it will send no requests while active",
+                            index + 1
+                        );
+                    }
                 }
             }
             LoadProfile::ArrivalRate {
@@ -546,6 +576,13 @@ impl Config {
                     .map_err(|e| anyhow::anyhow!("Invalid load_profile.duration: {e}"))?;
                 if *max_concurrency == 0 {
                     anyhow::bail!("load_profile.max_concurrency must be greater than 0");
+                }
+                // The semaphore that enforces this is drained with a u32
+                // permit count at the end of the run; a value that does not
+                // fit would silently truncate and let the run return before
+                // every in-flight request actually finished.
+                if *max_concurrency > u32::MAX as usize {
+                    anyhow::bail!("load_profile.max_concurrency must be at most {}", u32::MAX);
                 }
             }
         }
@@ -612,6 +649,20 @@ impl Config {
     /// Parse the configured per-request timeout.
     pub fn parse_timeout(&self) -> anyhow::Result<Duration> {
         parse_duration(&self.timeout)
+    }
+
+    /// Parse the configured Prometheus bind address.
+    pub fn parse_prometheus_bind(&self) -> anyhow::Result<std::net::IpAddr> {
+        self.prometheus_bind
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid prometheus_bind '{}'; expected an address such as \
+                 '127.0.0.1' or '0.0.0.0'",
+                    self.prometheus_bind
+                )
+            })
     }
 
     /// Parse the optional worker ramp-up duration.
@@ -740,6 +791,7 @@ impl Config {
         self.duration = expand_environment_value(&self.duration)?;
         self.timeout = expand_environment_value(&self.timeout)?;
         self.ramp_up = expand_optional(self.ramp_up.take())?;
+        self.prometheus_bind = expand_environment_value(&self.prometheus_bind)?;
         if let Some(profile) = &mut self.load_profile {
             match profile {
                 LoadProfile::Stages { stages } => {
@@ -935,6 +987,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -980,6 +1033,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1028,6 +1082,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1075,6 +1130,7 @@ mod tests {
             retry_on_status: vec![503],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1143,6 +1199,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1257,6 +1314,21 @@ output:
     }
 
     #[test]
+    fn test_prometheus_bind_defaults_to_loopback_and_rejects_garbage() {
+        let config = scenario_config(vec![]);
+        assert_eq!(config.prometheus_bind, "127.0.0.1");
+        assert_eq!(
+            config.parse_prometheus_bind().unwrap(),
+            std::net::IpAddr::from([127, 0, 0, 1])
+        );
+
+        let mut config = config;
+        config.prometheus_bind = "not-an-ip".to_string();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Invalid prometheus_bind"), "{error}");
+    }
+
+    #[test]
     fn test_valid_dependency_chain_is_accepted() {
         let config = scenario_config(vec![
             scenario("login", None),
@@ -1367,6 +1439,7 @@ output:
                 max_avg_ms: Some(200.0),
             }),
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -1400,6 +1473,7 @@ output:
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -1478,6 +1552,41 @@ output:
     }
 
     #[test]
+    fn test_stages_profile_rejects_an_all_zero_concurrency_profile() {
+        let config = stages_config(vec![
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 0,
+            },
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 0,
+            },
+        ]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("every stage at target_concurrency: 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_a_single_zero_concurrency_stage_is_a_legitimate_ramp_down() {
+        // Same shape as samples/staged-load-profile.yaml's trailing stage.
+        let config = stages_config(vec![
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 10,
+            },
+            Stage {
+                duration: "5s".to_string(),
+                target_concurrency: 0,
+            },
+        ]);
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn test_stages_profile_rejects_unparseable_duration() {
         let config = stages_config(vec![Stage {
             duration: "not-a-duration".to_string(),
@@ -1534,6 +1643,16 @@ output:
         let config = arrival_rate_config(10.0, "1m", 0);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("max_concurrency"), "{error}");
+    }
+
+    #[test]
+    fn test_arrival_rate_rejects_max_concurrency_that_would_not_fit_a_u32() {
+        // The semaphore that enforces this is drained with a u32 permit
+        // count; a value too large to fit would silently truncate instead.
+        let config = arrival_rate_config(10.0, "1m", u32::MAX as usize + 1);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_concurrency"), "{error}");
+        assert!(error.contains(&u32::MAX.to_string()), "{error}");
     }
 
     #[test]

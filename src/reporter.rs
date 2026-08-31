@@ -5,8 +5,15 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 use tera::{Context, Tera};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::JoinHandle;
+use tracing::warn;
+
+/// Rows buffered between the collector and the CSV writer task. Bounded so a
+/// writer that falls behind the request rate (a slow disk) cannot make the
+/// collector hold an unbounded backlog in memory; a row that does not fit is
+/// dropped and counted rather than queued.
+const CSV_CHANNEL_CAPACITY: usize = 10_000;
 
 /// Report data structure
 #[derive(Debug, Serialize)]
@@ -145,7 +152,7 @@ impl Reporter {
 /// Rows are written as they are produced, so a full-fidelity CSV never needs
 /// every request to be held in memory first.
 pub struct CsvResultStream {
-    sender: Option<UnboundedSender<RequestResult>>,
+    sender: Option<Sender<RequestResult>>,
     writer: JoinHandle<Result<usize>>,
 }
 
@@ -163,17 +170,20 @@ impl CsvResultStream {
             "error",
         ])?;
 
-        let (sender, mut receiver) = unbounded_channel::<RequestResult>();
+        let (sender, mut receiver) = channel::<RequestResult>(CSV_CHANNEL_CAPACITY);
         let task = tokio::spawn(async move {
             let mut rows = 0_usize;
             while let Some(result) = receiver.recv().await {
-                writer.write_record([
+                if let Err(e) = writer.write_record([
                     result.request_start_timestamp.to_rfc3339(),
                     result.scenario_name.clone().unwrap_or_default(),
                     result.latency_ms.to_string(),
                     result.status_code.to_string(),
                     result.error.clone().unwrap_or_default(),
-                ])?;
+                ]) {
+                    warn!("CSV writer failed after {rows} rows; stopping: {e}");
+                    return Err(e.into());
+                }
                 rows += 1;
             }
             writer.flush()?;
@@ -187,7 +197,7 @@ impl CsvResultStream {
     }
 
     /// Channel every recorded result should be forwarded to.
-    pub fn sender(&self) -> UnboundedSender<RequestResult> {
+    pub fn sender(&self) -> Sender<RequestResult> {
         self.sender
             .clone()
             .expect("sender is only taken when finishing the stream")
@@ -269,6 +279,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -300,6 +311,7 @@ mod tests {
                 request_start_timestamp: Utc::now(),
                 request_end_timestamp: Utc::now(),
             })
+            .await
             .unwrap();
         for latency in 0..100 {
             sender
@@ -311,6 +323,7 @@ mod tests {
                     request_start_timestamp: Utc::now(),
                     request_end_timestamp: Utc::now(),
                 })
+                .await
                 .unwrap();
         }
         drop(sender);
@@ -351,6 +364,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -412,6 +426,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -450,6 +465,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 100,
             dropped_results: 900,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -487,6 +503,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
         };
@@ -539,6 +556,7 @@ mod tests {
             skipped_scenarios: Default::default(),
             retained_results: 0,
             dropped_results: 0,
+            csv_dropped_rows: 0,
             load_profile: Some(LoadProfileSummary {
                 kind: "arrival_rate".to_string(),
                 target_rps: Some(30.0),
@@ -551,6 +569,7 @@ mod tests {
                 target_concurrency: None,
                 target_rps: Some(30.0),
                 planned_duration_secs: 2.0,
+                observed_duration_secs: 2.0,
                 metrics: stage_metrics,
             }],
         };

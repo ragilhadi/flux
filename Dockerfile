@@ -1,13 +1,6 @@
 # Stage 1: Build the Rust application
 FROM rust:slim AS builder
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 # Set working directory
 WORKDIR /build
 
@@ -33,6 +26,17 @@ COPY --from=builder /build/target/release/flux /usr/local/bin/flux
 
 # Make binary executable
 RUN chmod +x /usr/local/bin/flux
+
+# Run as a non-root user. The default config and output paths
+# (/app/config.yaml, /app/data, /app/results) are typically bind-mounted from
+# the host, so these directories are made writable by any UID rather than
+# just this one: a bind mount keeps the host directory's own permissions, and
+# the container's UID will rarely match the host user's.
+RUN useradd --no-create-home --uid 10001 flux && \
+    mkdir -p /app/data /app/results && \
+    chmod 777 /app/data /app/results
+USER flux
+WORKDIR /app
 
 # Run the application
 ENTRYPOINT ["/usr/local/bin/flux"]

@@ -8,9 +8,10 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -24,6 +25,20 @@ const REFRESH_PLACEHOLDER: &str = "__REFRESH_MS__";
 /// Largest request head accepted, in bytes. The dashboard only answers short
 /// GETs, so anything larger is a client bug or an attempt to tie up memory.
 const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
+
+/// Longest a connection may take to send its request head. A client that
+/// connects and sends nothing would otherwise park a task forever.
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most dashboard connections handled at once. Bounded so a burst of
+/// connections (or a client opening many and never closing them) cannot grow
+/// the number of concurrently spawned tasks without limit; a connection past
+/// this cap is closed immediately rather than queued. Small in tests so the
+/// cap can actually be exercised without opening dozens of sockets.
+#[cfg(not(test))]
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+#[cfg(test)]
+const MAX_CONCURRENT_CONNECTIONS: usize = 2;
 
 /// Lifecycle of the run, as reported by `/healthz`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,15 +160,32 @@ impl LiveDashboard {
             refresh_ms,
         });
         let server_state = Arc::clone(&state);
+        let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
-                        let (stream, _) = accepted?;
+                        // A transient accept error (an exhausted file
+                        // descriptor table under heavy load, for instance) is
+                        // logged and the dashboard keeps serving, rather than
+                        // taking the whole dashboard down over one bad
+                        // connection.
+                        let (stream, _) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                warn!("Live dashboard failed to accept a connection: {error}");
+                                continue;
+                            }
+                        };
+                        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                            debug!("Live dashboard is at its connection limit; dropping a connection");
+                            continue;
+                        };
                         let state = Arc::clone(&server_state);
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(error) = serve_connection(stream, state).await {
                                 debug!("Live dashboard connection failed: {error}");
                             }
@@ -277,8 +309,18 @@ async fn serve_connection(mut stream: TcpStream, state: Arc<DashboardState>) -> 
     Ok(())
 }
 
-/// Read until the end of the request head, giving up past the size cap.
+/// Read until the end of the request head, giving up past the size cap or
+/// once `CONNECTION_READ_TIMEOUT` has elapsed — a client that connects and
+/// sends nothing (or trickles bytes deliberately slowly) is treated the same
+/// as one sending an oversized head, rather than parking the task forever.
 async fn read_request_head(stream: &mut TcpStream) -> Result<Option<String>> {
+    match tokio::time::timeout(CONNECTION_READ_TIMEOUT, read_request_head_unbounded(stream)).await {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
+async fn read_request_head_unbounded(stream: &mut TcpStream) -> Result<Option<String>> {
     let mut head = Vec::new();
     let mut chunk = [0_u8; 1024];
 
@@ -287,8 +329,15 @@ async fn read_request_head(stream: &mut TcpStream) -> Result<Option<String>> {
         if bytes_read == 0 {
             break;
         }
+        let previous_len = head.len();
         head.extend_from_slice(&chunk[..bytes_read]);
-        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+        // Only the new bytes, plus the three before them, can complete the
+        // terminator — no need to rescan the whole buffer on every chunk.
+        let scan_from = previous_len.saturating_sub(3);
+        if head[scan_from..]
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
             break;
         }
         if head.len() > MAX_REQUEST_HEAD_BYTES {
@@ -372,6 +421,7 @@ mod tests {
             retry_on_status: vec![],
             assertions: None,
             prometheus_port: None,
+            prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard,
             mode: "async".to_string(),
             output: OutputConfig {
@@ -600,6 +650,55 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
         assert!(body.contains("\"total_requests\":0"), "{body}");
 
+        dashboard.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connections_past_the_cap_are_closed_rather_than_queued() {
+        let dashboard = start_dashboard(
+            &config(Some(ephemeral_dashboard())),
+            Arc::new(MetricsCollector::new()),
+            Cancellation::new(),
+        )
+        .await;
+
+        // MAX_CONCURRENT_CONNECTIONS is 2 under `cfg(test)`. Open that many
+        // connections and send nothing, so each is accepted and occupies a
+        // permit while it blocks reading its request head.
+        let mut idle = Vec::new();
+        for _ in 0..2 {
+            idle.push(TcpStream::connect(dashboard.local_addr()).await.unwrap());
+        }
+        // Give the server time to accept and start reading each connection
+        // before the next one is opened.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A connection past the cap should be closed immediately rather than
+        // queued: read to EOF with no response, well inside the read
+        // timeout.
+        let mut extra = TcpStream::connect(dashboard.local_addr()).await.unwrap();
+        extra
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            extra.read_to_string(&mut response),
+        )
+        .await
+        .expect("connection past the cap should close promptly, not hang");
+        // The server drops the connection without reading the request that
+        // was already written, so a clean FIN (Ok(0)) and a reset (unread
+        // data at close, common on Linux) both signal "rejected" — either
+        // way, no response was sent.
+        match read {
+            Ok(bytes) => assert_eq!(bytes, 0),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}"),
+        }
+        assert!(response.is_empty(), "{response}");
+
+        drop(idle);
         dashboard.shutdown().await.unwrap();
     }
 }

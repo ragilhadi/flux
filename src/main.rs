@@ -323,7 +323,15 @@ async fn main() -> Result<()> {
     };
 
     let prometheus_server = match config.prometheus_port {
-        Some(port) => match PrometheusServer::start(port, Arc::clone(&metrics)).await {
+        Some(port) => match PrometheusServer::start(
+            config
+                .parse_prometheus_bind()
+                .expect("validated at config load"),
+            port,
+            Arc::clone(&metrics),
+        )
+        .await
+        {
             Ok(server) => {
                 info!(
                     "Prometheus metrics available at http://{}/metrics",
@@ -357,14 +365,26 @@ async fn main() -> Result<()> {
     // Start live metrics update task
     let metrics_clone = Arc::clone(&metrics);
     let ui_cancellation = cancellation.clone();
+    // Separate from `cancellation` (SIGINT/SIGTERM): this only tells the UI
+    // ticker the run has ended, so a run that finishes for any reason other
+    // than reaching `elapsed >= total_secs` (an executor error, a profile
+    // whose own duration ran short) does not leave the ticker idling for the
+    // rest of the originally planned duration before the summary can print.
+    let run_finished = Cancellation::new();
+    let ui_run_finished = run_finished.clone();
     let ui_handle = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
+        // `interval`'s first tick fires immediately rather than after one
+        // period, which would otherwise run `elapsed` a full second ahead of
+        // real wall-clock time for the whole display.
+        ticker.tick().await;
         let mut elapsed = 0u64;
 
         loop {
             tokio::select! {
                 biased;
                 _ = ui_cancellation.cancelled() => break,
+                _ = ui_run_finished.cancelled() => break,
                 _ = ticker.tick() => {}
             }
             elapsed += 1;
@@ -383,6 +403,7 @@ async fn main() -> Result<()> {
     // Run the load test
     info!("Starting load test execution");
     let execution_result = executor.run(duration_secs).await;
+    run_finished.cancel();
 
     if let Some(server) = prometheus_server {
         if let Err(e) = server.shutdown().await {
@@ -409,6 +430,7 @@ async fn main() -> Result<()> {
     // Generate summary
     info!("Generating summary");
     let summary = metrics.generate_summary();
+    let csv_dropped_rows = summary.csv_dropped_rows;
     let results = metrics.get_results();
     let assertion_failures = config.evaluate_assertions(&summary);
 
@@ -441,7 +463,13 @@ async fn main() -> Result<()> {
         metrics.close_result_stream();
         match stream.finish().await {
             Ok(rows) => {
-                ui.display_success(&format!("CSV report saved to: {csv_path} ({rows} rows)"))
+                ui.display_success(&format!("CSV report saved to: {csv_path} ({rows} rows)"));
+                if csv_dropped_rows > 0 {
+                    ui.display_warning(&format!(
+                        "{csv_dropped_rows} row(s) were dropped from the CSV output because \
+                         the writer fell behind; JSON/HTML statistics still cover every request"
+                    ));
+                }
             }
             Err(e) => error!("Failed to generate CSV report: {}", e),
         }
