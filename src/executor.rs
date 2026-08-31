@@ -277,7 +277,9 @@ impl Executor {
         }
 
         // Wait for every in-flight request to finish: once every permit is
-        // back, no spawned task can still be running.
+        // back, no spawned task can still be running. Config validation
+        // rejects a max_concurrency that would not fit in a u32, so this
+        // cast cannot truncate.
         let _ = semaphore.acquire_many(max_concurrency as u32).await;
 
         Ok(())

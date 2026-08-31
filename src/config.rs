@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing::warn;
 
 /// Main configuration structure for Flux load testing
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -539,12 +540,28 @@ impl Config {
                 if stages.is_empty() {
                     anyhow::bail!("load_profile.stages must contain at least one stage");
                 }
+                if stages.iter().all(|stage| stage.target_concurrency == 0) {
+                    anyhow::bail!(
+                        "load_profile.stages has every stage at target_concurrency: 0; \
+                         the run would send no requests"
+                    );
+                }
                 for (index, stage) in stages.iter().enumerate() {
                     // `parse_duration` itself rejects a zero duration, so
                     // stages can never be given a no-op hold time.
                     parse_duration(&stage.duration).map_err(|e| {
                         anyhow::anyhow!("Invalid duration for stage {}: {e}", index + 1)
                     })?;
+                    // A single zero-concurrency stage is a legitimate
+                    // ramp-down (see samples/staged-load-profile.yaml), so it
+                    // is only worth a warning, not a hard error.
+                    if stage.target_concurrency == 0 {
+                        warn!(
+                            "load_profile stage {} has target_concurrency: 0; \
+                             it will send no requests while active",
+                            index + 1
+                        );
+                    }
                 }
             }
             LoadProfile::ArrivalRate {
@@ -559,6 +576,13 @@ impl Config {
                     .map_err(|e| anyhow::anyhow!("Invalid load_profile.duration: {e}"))?;
                 if *max_concurrency == 0 {
                     anyhow::bail!("load_profile.max_concurrency must be greater than 0");
+                }
+                // The semaphore that enforces this is drained with a u32
+                // permit count at the end of the run; a value that does not
+                // fit would silently truncate and let the run return before
+                // every in-flight request actually finished.
+                if *max_concurrency > u32::MAX as usize {
+                    anyhow::bail!("load_profile.max_concurrency must be at most {}", u32::MAX);
                 }
             }
         }
@@ -1528,6 +1552,41 @@ output:
     }
 
     #[test]
+    fn test_stages_profile_rejects_an_all_zero_concurrency_profile() {
+        let config = stages_config(vec![
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 0,
+            },
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 0,
+            },
+        ]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("every stage at target_concurrency: 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_a_single_zero_concurrency_stage_is_a_legitimate_ramp_down() {
+        // Same shape as samples/staged-load-profile.yaml's trailing stage.
+        let config = stages_config(vec![
+            Stage {
+                duration: "10s".to_string(),
+                target_concurrency: 10,
+            },
+            Stage {
+                duration: "5s".to_string(),
+                target_concurrency: 0,
+            },
+        ]);
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn test_stages_profile_rejects_unparseable_duration() {
         let config = stages_config(vec![Stage {
             duration: "not-a-duration".to_string(),
@@ -1584,6 +1643,16 @@ output:
         let config = arrival_rate_config(10.0, "1m", 0);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("max_concurrency"), "{error}");
+    }
+
+    #[test]
+    fn test_arrival_rate_rejects_max_concurrency_that_would_not_fit_a_u32() {
+        // The semaphore that enforces this is drained with a u32 permit
+        // count; a value too large to fit would silently truncate instead.
+        let config = arrival_rate_config(10.0, "1m", u32::MAX as usize + 1);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_concurrency"), "{error}");
+        assert!(error.contains(&u32::MAX.to_string()), "{error}");
     }
 
     #[test]
