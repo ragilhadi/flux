@@ -365,14 +365,26 @@ async fn main() -> Result<()> {
     // Start live metrics update task
     let metrics_clone = Arc::clone(&metrics);
     let ui_cancellation = cancellation.clone();
+    // Separate from `cancellation` (SIGINT/SIGTERM): this only tells the UI
+    // ticker the run has ended, so a run that finishes for any reason other
+    // than reaching `elapsed >= total_secs` (an executor error, a profile
+    // whose own duration ran short) does not leave the ticker idling for the
+    // rest of the originally planned duration before the summary can print.
+    let run_finished = Cancellation::new();
+    let ui_run_finished = run_finished.clone();
     let ui_handle = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
+        // `interval`'s first tick fires immediately rather than after one
+        // period, which would otherwise run `elapsed` a full second ahead of
+        // real wall-clock time for the whole display.
+        ticker.tick().await;
         let mut elapsed = 0u64;
 
         loop {
             tokio::select! {
                 biased;
                 _ = ui_cancellation.cancelled() => break,
+                _ = ui_run_finished.cancelled() => break,
                 _ = ticker.tick() => {}
             }
             elapsed += 1;
@@ -391,6 +403,7 @@ async fn main() -> Result<()> {
     // Run the load test
     info!("Starting load test execution");
     let execution_result = executor.run(duration_secs).await;
+    run_finished.cancel();
 
     if let Some(server) = prometheus_server {
         if let Err(e) = server.shutdown().await {
