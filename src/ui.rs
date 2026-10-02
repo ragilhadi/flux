@@ -402,21 +402,32 @@ fn display_resources(resources: &ResourceReport) {
         }
     }
 
+    for group in resources
+        .groups
+        .iter()
+        .filter(|group| group.source == "scrape")
+    {
+        let summary = |metric: &str| {
+            resources
+                .series(&format!("{}.{metric}", group.name))
+                .map(|series| series.summary.clone())
+        };
+        if let (Some(time), Some(size)) = (summary("scrape_ms"), summary("scrape_kib")) {
+            line(
+                &format!("Scrape cost '{}'", group.name),
+                format!(
+                    "avg {:.1} ms (max {:.1} ms), {:.0} KiB per scrape",
+                    time.avg, time.max, size.avg
+                ),
+            );
+        }
+    }
+
     for warning in &resources.warnings {
         println!("  {} {}", "⚠".bright_yellow(), warning.bright_yellow());
     }
     for error in &resources.errors {
         println!("  {} {}", "✗".bright_red(), error.bright_red());
-    }
-    if !resources.missing.is_empty() {
-        println!(
-            "  {}",
-            format!(
-                "{} metric(s) had no data (exporter does not publish them); see the report",
-                resources.missing.len()
-            )
-            .dimmed()
-        );
     }
 }
 

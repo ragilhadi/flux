@@ -1,10 +1,10 @@
 # System-resource monitoring example
 #
 # The load generator and the host it runs on are always monitored (from
-# /proc). This sample adds a target container read from Prometheus
-# (cAdvisor + node_exporter presets) and fails the run when the target
-# saturates. See samples/monitoring/ for a docker-compose stack that runs
-# everything together.
+# /proc). This sample adds a target container (cAdvisor) and its host
+# (node_exporter), scraped directly by Flux, and fails the run when the
+# target saturates. See samples/monitoring/ for a docker-compose stack with
+# both exporters trimmed down to what Flux reads.
 target: "http://api:8080/health"
 method: "GET"
 
@@ -16,38 +16,20 @@ load_profile:
     - { duration: "1m", target_concurrency: 100 }
 
 monitoring:
-  interval: "2s"           # how often /proc and scrape targets are sampled
+  interval: "2s"           # how often /proc and the exporters are sampled (min 1s with scrape targets)
   self: true               # Flux's own CPU, memory, threads, file descriptors
   host: true               # host CPU (total + per core), memory, load average
   per_core: true
-  prometheus:
-    url: "http://prometheus:9090"
-    # bearer_token_env: "PROM_TOKEN"  # token read from this env var
-    step: "2s"
-    rate_window: "15s"     # must span at least two scrapes of the exporter
-    query_delay: "5s"      # wait for the final scrape before querying
-    targets:
-      - name: api
-        type: cadvisor
-        selector: 'name="api"'           # Kubernetes: container="api",namespace="prod"
-      - name: node
-        type: node
-        selector: 'job="node-exporter"'
-        per_core: true
-    queries:
-      - name: http_requests_per_sec
-        query: 'sum(rate(http_requests_total{job="api"}[15s]))'
-        unit: "1/s"
-        group: api-app
-  # Without Prometheus, scrape the exporters directly instead:
-  # scrape:
-  #   - name: api
-  #     type: cadvisor
-  #     url: "http://cadvisor:8080/metrics"
-  #     selector: 'name="api"'
-  #   - name: node
-  #     type: node
-  #     url: "http://node-exporter:9100/metrics"
+  scrape:
+    - name: api
+      type: cadvisor
+      url: "http://cadvisor:8080/metrics"
+      selector: 'name="api"'               # Kubernetes kubelet: container="api",namespace="prod"
+    - name: node
+      type: node
+      url: "http://node-exporter:9100/metrics"
+      per_core: true
+      # bearer_token_env: "NODE_TOKEN"     # token read from this env var
 
 assertions:
   max_p95_ms: 300

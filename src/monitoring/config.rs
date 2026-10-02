@@ -11,13 +11,22 @@ pub const LOADGEN_GROUP: &str = "flux";
 /// Group name used for host metrics read from the local `/proc`.
 pub const HOST_GROUP: &str = "host";
 
+/// Shortest interval at which exporters may be scraped. A cAdvisor scrape
+/// renders every container on the host, so polling it faster than this costs
+/// the machine under test more than it tells you.
+const MIN_SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// `monitoring` section of the configuration.
 ///
 /// Monitoring is on by default, but only for what needs no setup: the load
 /// generator's own process and the host it runs on, both read from `/proc`.
-/// Target containers and remote hosts are observed only when a `prometheus`
-/// or `scrape` source is configured.
+/// Target containers and remote hosts are observed only when `scrape`
+/// targets (cAdvisor, node_exporter) are configured.
+///
+/// Unknown keys are rejected, so a misspelt option fails loudly instead of
+/// silently monitoring less than intended.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MonitoringConfig {
     /// Master switch. `false` collects nothing and adds nothing to reports.
     #[serde(default = "default_true")]
@@ -42,12 +51,8 @@ pub struct MonitoringConfig {
     #[serde(default = "default_true")]
     pub per_core: bool,
 
-    /// Query a Prometheus server for the test window after the run.
-    #[serde(default)]
-    pub prometheus: Option<PrometheusSourceConfig>,
-
-    /// Scrape Prometheus-format `/metrics` endpoints (cAdvisor,
-    /// node_exporter) directly while the test runs.
+    /// cAdvisor and node_exporter `/metrics` endpoints, scraped directly
+    /// while the test runs.
     #[serde(default)]
     pub scrape: Vec<ScrapeTargetConfig>,
 }
@@ -60,51 +65,12 @@ impl Default for MonitoringConfig {
             self_metrics: true,
             host: true,
             per_core: true,
-            prometheus: None,
             scrape: Vec::new(),
         }
     }
 }
 
-/// Where target metrics come from in Prometheus.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PrometheusSourceConfig {
-    /// Base URL of the Prometheus HTTP API, e.g. "http://prometheus:9090".
-    pub url: String,
-
-    /// Name of an environment variable holding a bearer token. The token is
-    /// read at runtime and never written to reports.
-    #[serde(default)]
-    pub bearer_token_env: Option<String>,
-
-    /// Resolution of the queried series. Defaults to `monitoring.interval`.
-    #[serde(default)]
-    pub step: Option<String>,
-
-    /// Range used inside `rate()`. It must span at least two scrapes of the
-    /// underlying exporter, or rates come back empty.
-    #[serde(default = "default_rate_window")]
-    pub rate_window: String,
-
-    /// How long to wait after the run before querying, so the scrape that
-    /// covers the end of the test has landed in Prometheus.
-    #[serde(default = "default_query_delay")]
-    pub query_delay: String,
-
-    /// Timeout for each query.
-    #[serde(default = "default_query_timeout")]
-    pub timeout: String,
-
-    /// Preset targets (cAdvisor containers, node_exporter hosts).
-    #[serde(default)]
-    pub targets: Vec<PrometheusTargetConfig>,
-
-    /// Arbitrary PromQL queries, recorded as-is.
-    #[serde(default)]
-    pub queries: Vec<CustomQueryConfig>,
-}
-
-/// Kind of exporter a preset target reads.
+/// Kind of exporter a scrape target is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
@@ -123,45 +89,9 @@ impl TargetKind {
     }
 }
 
-/// A preset target read through Prometheus.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PrometheusTargetConfig {
-    /// Name used for this target in reports and assertions.
-    pub name: String,
-
-    #[serde(rename = "type")]
-    pub kind: TargetKind,
-
-    /// PromQL label matchers selecting the target, without braces, e.g.
-    /// `name="my-api"` or `container="api",namespace="prod"`.
-    #[serde(default)]
-    pub selector: String,
-
-    /// Record one series per CPU core (node targets only).
-    #[serde(default = "default_true")]
-    pub per_core: bool,
-}
-
-/// A custom PromQL query.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CustomQueryConfig {
-    /// Metric name used in reports.
-    pub name: String,
-
-    /// PromQL expression evaluated over the test window.
-    pub query: String,
-
-    /// Free-form unit label for display (e.g. "count", "ms", "percent").
-    #[serde(default)]
-    pub unit: Option<String>,
-
-    /// Group the series belongs to in reports. Defaults to "custom".
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
 /// A `/metrics` endpoint scraped directly while the test runs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScrapeTargetConfig {
     /// Name used for this target in reports and assertions.
     pub name: String,
@@ -169,12 +99,12 @@ pub struct ScrapeTargetConfig {
     #[serde(rename = "type")]
     pub kind: TargetKind,
 
-    /// URL of the Prometheus text-format endpoint, e.g.
+    /// URL of the text-format metrics endpoint, e.g.
     /// "http://cadvisor:8080/metrics".
     pub url: String,
 
     /// Label matchers selecting the series to use, e.g. `name="my-api"`.
-    /// Only `=` and `!=` are supported when scraping directly.
+    /// Only `=` and `!=` are supported.
     #[serde(default)]
     pub selector: String,
 
@@ -183,7 +113,8 @@ pub struct ScrapeTargetConfig {
     pub per_core: bool,
 
     /// Name of an environment variable holding a bearer token for the
-    /// endpoint, if it requires one.
+    /// endpoint, if it requires one. The token is read at runtime and never
+    /// written to reports.
     #[serde(default)]
     pub bearer_token_env: Option<String>,
 }
@@ -194,18 +125,6 @@ fn default_true() -> bool {
 
 fn default_interval() -> String {
     "2s".to_string()
-}
-
-fn default_rate_window() -> String {
-    "30s".to_string()
-}
-
-fn default_query_delay() -> String {
-    "5s".to_string()
-}
-
-fn default_query_timeout() -> String {
-    "15s".to_string()
 }
 
 impl MonitoringConfig {
@@ -224,11 +143,7 @@ impl MonitoringConfig {
 
     /// Whether anything needs to run at all.
     pub fn is_active(&self) -> bool {
-        self.enabled
-            && (self.self_metrics
-                || self.host
-                || self.prometheus.is_some()
-                || !self.scrape.is_empty())
+        self.enabled && (self.self_metrics || self.host || !self.scrape.is_empty())
     }
 
     /// Validate the section, so a typo fails the run before any traffic is
@@ -237,81 +152,25 @@ impl MonitoringConfig {
         if !self.enabled {
             return Ok(());
         }
-        self.parse_interval()?;
-
-        let mut groups: HashSet<String> = HashSet::new();
-        groups.insert(LOADGEN_GROUP.to_string());
-        groups.insert(HOST_GROUP.to_string());
-        let mut claim = |name: &str, field: &str| -> anyhow::Result<()> {
-            validate_name(name, field)?;
-            if !groups.insert(name.to_string()) {
-                anyhow::bail!(
-                    "{field} '{name}' is already used; target names must be unique and \
-                     '{LOADGEN_GROUP}' and '{HOST_GROUP}' are reserved"
-                );
-            }
-            Ok(())
-        };
-
-        if let Some(prometheus) = &self.prometheus {
-            let url = reqwest::Url::parse(prometheus.url.trim()).map_err(|e| {
-                anyhow::anyhow!(
-                    "Invalid monitoring.prometheus.url '{}': {e}",
-                    prometheus.url
-                )
-            })?;
-            if !matches!(url.scheme(), "http" | "https") {
-                anyhow::bail!("monitoring.prometheus.url must use http or https");
-            }
-            if let Some(step) = &prometheus.step {
-                let step = crate::config::parse_duration(step)
-                    .map_err(|e| anyhow::anyhow!("Invalid monitoring.prometheus.step: {e}"))?;
-                if step < Duration::from_secs(1) {
-                    anyhow::bail!("monitoring.prometheus.step must be at least 1s");
-                }
-            }
-            prometheus.parse_rate_window()?;
-            crate::config::parse_duration_allow_zero(&prometheus.query_delay)
-                .map_err(|e| anyhow::anyhow!("Invalid monitoring.prometheus.query_delay: {e}"))?;
-            crate::config::parse_duration(&prometheus.timeout)
-                .map_err(|e| anyhow::anyhow!("Invalid monitoring.prometheus.timeout: {e}"))?;
-            if prometheus.targets.is_empty() && prometheus.queries.is_empty() {
-                anyhow::bail!(
-                    "monitoring.prometheus needs at least one entry under 'targets' or 'queries'"
-                );
-            }
-            for target in &prometheus.targets {
-                claim(&target.name, "monitoring.prometheus.targets name")?;
-                if target.selector.contains('{') || target.selector.contains('}') {
-                    anyhow::bail!(
-                        "monitoring.prometheus.targets '{}': write the selector without braces, \
-                         e.g. name=\"my-api\"",
-                        target.name
-                    );
-                }
-            }
-            let mut query_names: HashSet<(String, String)> = HashSet::new();
-            for query in &prometheus.queries {
-                validate_name(&query.name, "monitoring.prometheus.queries name")?;
-                if query.query.trim().is_empty() {
-                    anyhow::bail!(
-                        "monitoring.prometheus.queries '{}' has an empty query",
-                        query.name
-                    );
-                }
-                let group = query.group.clone().unwrap_or_else(|| "custom".to_string());
-                validate_name(&group, "monitoring.prometheus.queries group")?;
-                if !query_names.insert((group.clone(), query.name.clone())) {
-                    anyhow::bail!(
-                        "monitoring.prometheus.queries '{}' is defined twice in group '{group}'",
-                        query.name
-                    );
-                }
-            }
+        let interval = self.parse_interval()?;
+        if !self.scrape.is_empty() && interval < MIN_SCRAPE_INTERVAL {
+            anyhow::bail!(
+                "monitoring.interval must be at least 1s when scrape targets are configured, \
+                 got '{}'; faster scraping costs the machine under test more than it shows",
+                self.interval
+            );
         }
 
+        let mut groups: HashSet<&str> = HashSet::from([LOADGEN_GROUP, HOST_GROUP]);
         for target in &self.scrape {
-            claim(&target.name, "monitoring.scrape name")?;
+            validate_name(&target.name, "monitoring.scrape name")?;
+            if !groups.insert(target.name.as_str()) {
+                anyhow::bail!(
+                    "monitoring.scrape name '{}' is already used; target names must be unique \
+                     and '{LOADGEN_GROUP}' and '{HOST_GROUP}' are reserved",
+                    target.name
+                );
+            }
             let url = reqwest::Url::parse(target.url.trim()).map_err(|e| {
                 anyhow::anyhow!("Invalid monitoring.scrape '{}' url: {e}", target.name)
             })?;
@@ -327,18 +186,6 @@ impl MonitoringConfig {
         }
 
         Ok(())
-    }
-}
-
-impl PrometheusSourceConfig {
-    /// Range used inside `rate()`.
-    pub fn parse_rate_window(&self) -> anyhow::Result<Duration> {
-        let window = crate::config::parse_duration(&self.rate_window)
-            .map_err(|e| anyhow::anyhow!("Invalid monitoring.prometheus.rate_window: {e}"))?;
-        if window < Duration::from_secs(1) {
-            anyhow::bail!("monitoring.prometheus.rate_window must be at least 1s");
-        }
-        Ok(window)
     }
 }
 
@@ -369,7 +216,7 @@ mod tests {
     fn test_defaults_enable_local_sources_only() {
         let config = MonitoringConfig::default();
         assert!(config.enabled && config.self_metrics && config.host && config.per_core);
-        assert!(config.prometheus.is_none() && config.scrape.is_empty());
+        assert!(config.scrape.is_empty());
         assert!(config.is_active());
         config.validate().unwrap();
     }
@@ -381,33 +228,21 @@ mod tests {
 interval: "1s"
 self: true
 host: false
-prometheus:
-  url: "http://prometheus:9090"
-  bearer_token_env: "PROM_TOKEN"
-  step: "5s"
-  targets:
-    - name: api
-      type: cadvisor
-      selector: 'name="my-api"'
-    - name: node
-      type: node
-      selector: 'instance="node:9100"'
-      per_core: false
-  queries:
-    - name: db_connections
-      query: 'sum(pg_stat_activity_count)'
-      unit: count
 scrape:
-  - name: api-direct
+  - name: api
     type: cadvisor
     url: "http://cadvisor:8080/metrics"
     selector: 'name="my-api"'
+  - name: node
+    type: node
+    url: "http://node-exporter:9100/metrics"
+    per_core: false
+    bearer_token_env: "NODE_TOKEN"
 "#,
         );
         config.validate().unwrap();
-        let prometheus = config.prometheus.as_ref().unwrap();
-        assert_eq!(prometheus.targets[0].kind, TargetKind::Cadvisor);
-        assert!(!prometheus.targets[1].per_core);
+        assert_eq!(config.scrape[0].kind, TargetKind::Cadvisor);
+        assert!(!config.scrape[1].per_core);
         assert!(!config.host);
     }
 
@@ -425,12 +260,9 @@ scrape:
 
         let duplicate = parse(
             r#"
-prometheus:
-  url: "http://prometheus:9090"
-  targets:
-    - { name: api, type: cadvisor, selector: 'name="a"' }
 scrape:
   - { name: api, type: cadvisor, url: "http://cadvisor:8080/metrics" }
+  - { name: api, type: node, url: "http://node:9100/metrics" }
 "#,
         );
         assert!(duplicate.validate().is_err());
@@ -439,19 +271,16 @@ scrape:
     #[test]
     fn test_rejects_bad_values() {
         assert!(parse("interval: \"100ms\"").validate().is_err());
-        assert!(
-            parse("prometheus: { url: \"ftp://x\", queries: [{name: a, query: up}] }")
-                .validate()
-                .is_err()
-        );
-        assert!(parse("prometheus: { url: \"http://x:9090\" }")
-            .validate()
-            .is_err());
         assert!(parse(
-            "prometheus: { url: \"http://x:9090\", targets: [{name: a, type: cadvisor, selector: '{name=\"a\"}'}] }"
+            "interval: \"500ms\"\nscrape: [{name: a, type: node, url: \"http://n/metrics\"}]"
         )
         .validate()
         .is_err());
+        assert!(
+            parse("scrape: [{name: a, type: node, url: \"ftp://n/metrics\"}]")
+                .validate()
+                .is_err()
+        );
         assert!(parse(
             "scrape: [{name: a, type: cadvisor, url: \"http://c/metrics\", selector: 'name=~\"a.*\"'}]"
         )
@@ -462,6 +291,20 @@ scrape:
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_unknown_keys_are_rejected() {
+        assert!(serde_yaml::from_str::<MonitoringConfig>("prometheus: {url: x}").is_err());
+        assert!(serde_yaml::from_str::<MonitoringConfig>(
+            "scrape: [{name: a, type: node, url: \"http://n/metrics\", selecter: x}]"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_local_only_monitoring_allows_sub_second_interval() {
+        parse("interval: \"500ms\"").validate().unwrap();
     }
 
     #[test]

@@ -479,3 +479,22 @@ intr 12399\n";
         assert!(store.is_empty());
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// `cargo test --release proc_sample_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn proc_sample_cost() {
+        let mut sampler = ProcSampler::new(true, true, true);
+        let mut store = SeriesStore::default();
+        let rounds = 1_000;
+        let started = std::time::Instant::now();
+        for round in 0..rounds {
+            sampler.sample(round as f64, &mut store);
+        }
+        println!("one /proc sample: {:?}", started.elapsed() / rounds);
+    }
+}

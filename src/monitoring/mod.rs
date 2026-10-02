@@ -7,16 +7,21 @@
 //! - the load generator itself (`/proc/self`), so a saturated Flux is never
 //!   mistaken for a slow target;
 //! - the host Flux runs on (`/proc/stat`, `/proc/meminfo`), total and per core;
-//! - target containers and hosts, either from a Prometheus server queried
-//!   after the run (cAdvisor and node_exporter presets plus custom PromQL) or
-//!   by scraping `/metrics` endpoints directly while the test runs.
+//! - target containers (cAdvisor) and hosts (node_exporter), by scraping
+//!   their `/metrics` endpoints directly while the test runs.
+//!
+//! Monitoring is built to stay out of the way of the load it observes: one
+//! lightweight task samples every source per interval, scrape bodies are
+//! size-capped, only the metric families Flux uses are parsed, and parsing
+//! runs on the blocking pool rather than the runtime threads driving the
+//! load. What each scrape cost is itself recorded (`scrape_ms`,
+//! `scrape_kib`) so the overhead is visible in every report.
 //!
 //! Monitoring never fails a run: a source that cannot be reached is reported
 //! under `errors` in the resource report and the load test carries on.
 
 pub mod config;
 pub mod procfs;
-pub mod promql;
 pub mod scrape;
 pub mod series;
 pub mod view;
@@ -32,10 +37,9 @@ use scrape::ScrapeTarget;
 use serde::{Deserialize, Serialize};
 use series::{SeriesBuffer, SeriesKind, SeriesStore};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
 
 /// Load-generator CPU (p95, percent of the cores available to it) at which
 /// results are flagged as possibly limited by Flux itself.
@@ -63,6 +67,18 @@ const HOT_CORE_HOST_AVG_BELOW_PERCENT: f64 = 50.0;
 
 /// CPU steal (p95) that suggests a noisy neighbour on a shared VM.
 const STEAL_WARN_PERCENT: f64 = 10.0;
+
+/// Average scrape time, as a share of the interval, worth flagging: the
+/// exporter is working hard on the machine under test.
+const SCRAPE_TIME_WARN_SHARE: f64 = 0.25;
+
+/// Average scrape size worth flagging: cAdvisor is exporting far more than
+/// Flux reads.
+const SCRAPE_SIZE_WARN_KIB: f64 = 4.0 * 1024.0;
+
+/// Largest scrape body accepted. Past this the scrape is dropped for that
+/// tick rather than letting monitoring hold that much memory.
+const MAX_SCRAPE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Summary statistics of one series over the measured window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -97,7 +113,7 @@ pub struct ResourceSeries {
     pub metric: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// `self`, `host`, `prometheus` or `scrape`.
+    /// `self`, `host` or `scrape`.
     pub source: String,
     pub unit: String,
     /// `gauge` or `counter`.
@@ -112,7 +128,7 @@ pub struct ResourceSeries {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceGroup {
     pub name: String,
-    /// `loadgen`, `host`, `container`, `node` or `custom`.
+    /// `loadgen`, `host`, `container` or `node`.
     pub kind: String,
     pub source: String,
 }
@@ -195,9 +211,6 @@ pub struct StageResources {
 pub struct ResourceReport {
     /// Sampling interval of local and scraped sources, in seconds.
     pub interval_secs: f64,
-    /// Resolution of Prometheus series, when a Prometheus source was used.
-    #[serde(default)]
-    pub prometheus_step_secs: Option<f64>,
     /// Summaries cover `[summary_from_secs, summary_to_secs]` seconds since
     /// the run started: the measured window, with ramp-up excluded.
     pub summary_from_secs: f64,
@@ -214,10 +227,6 @@ pub struct ResourceReport {
     /// Sources that failed. The load test itself is unaffected.
     #[serde(default)]
     pub errors: Vec<String>,
-    /// Queries that returned no data (an exporter that does not publish that
-    /// metric, typically).
-    #[serde(default)]
-    pub missing: Vec<String>,
 }
 
 impl ResourceReport {
@@ -248,7 +257,6 @@ pub struct ResourceMonitor {
     stop: Cancellation,
     task: Option<JoinHandle<SamplerOutput>>,
     redactor: Redactor,
-    prometheus_token: Option<String>,
 }
 
 fn read_token(variable: &Option<String>, field: &str) -> anyhow::Result<Option<String>> {
@@ -280,14 +288,7 @@ impl ResourceMonitor {
         }
         let interval = config.parse_interval()?;
 
-        let prometheus_token = match &config.prometheus {
-            Some(prometheus) => read_token(
-                &prometheus.bearer_token_env,
-                "monitoring.prometheus.bearer_token_env",
-            )?,
-            None => None,
-        };
-        let mut secrets: Vec<String> = prometheus_token.iter().cloned().collect();
+        let mut secrets: Vec<String> = Vec::new();
         let mut scrape_targets = Vec::new();
         for target in &config.scrape {
             let token = read_token(
@@ -345,15 +346,13 @@ impl ResourceMonitor {
             stop,
             task: Some(task),
             redactor,
-            prometheus_token,
         }))
     }
 
-    /// Stop sampling, query Prometheus for the test window if configured, and
-    /// build the report for a run summarised by `summary`.
+    /// Stop sampling and build the report for a run summarised by `summary`.
     pub async fn finish(mut self, summary: &MetricsSummary) -> ResourceReport {
         self.stop.cancel();
-        let mut output = match self.task.take() {
+        let output = match self.task.take() {
             Some(task) => task.await.unwrap_or_else(|error| {
                 let mut output = SamplerOutput::default();
                 output.error(format!("resource sampler stopped unexpectedly: {error}"));
@@ -365,15 +364,6 @@ impl ResourceMonitor {
         let run_start = to_secs(summary.start_time);
         let run_end = to_secs(summary.end_time);
         let measured_from = run_start + summary.ramp_up_secs;
-
-        let mut missing = Vec::new();
-        let mut prometheus_step = None;
-        if let Some(prometheus) = &self.config.prometheus {
-            prometheus_step = Some(
-                self.query_prometheus(prometheus, run_start, run_end, &mut output, &mut missing)
-                    .await,
-            );
-        }
 
         let mut errors: Vec<String> = output
             .errors
@@ -390,7 +380,7 @@ impl ResourceMonitor {
         if output.store.dropped_series > 0 {
             errors.push(format!(
                 "{} series were not kept because the limit of {} series was reached; \
-                 narrow custom queries with labels or aggregation",
+                 narrow the scrape selectors",
                 output.store.dropped_series,
                 series::MAX_SERIES
             ));
@@ -406,7 +396,6 @@ impl ResourceMonitor {
 
         let mut report = ResourceReport {
             interval_secs: self.interval.as_secs_f64(),
-            prometheus_step_secs: prometheus_step,
             summary_from_secs: measured_from - run_start,
             summary_to_secs: run_end - run_start,
             groups: self.groups(),
@@ -415,96 +404,10 @@ impl ResourceMonitor {
             per_stage,
             warnings: Vec::new(),
             errors,
-            missing,
         };
         report.derived = derive(&report, summary);
         report.warnings = warnings(&report);
         report
-    }
-
-    async fn query_prometheus(
-        &self,
-        prometheus: &config::PrometheusSourceConfig,
-        run_start: f64,
-        run_end: f64,
-        output: &mut SamplerOutput,
-        missing: &mut Vec<String>,
-    ) -> f64 {
-        let configured_step = prometheus
-            .step
-            .as_deref()
-            .and_then(|step| crate::config::parse_duration(step).ok())
-            .unwrap_or(self.interval);
-        let step = promql::query_step(configured_step, run_start, run_end);
-
-        let delay =
-            crate::config::parse_duration_allow_zero(&prometheus.query_delay).unwrap_or_default();
-        if !delay.is_zero() {
-            info!(
-                "Waiting {:.0}s for Prometheus to scrape the end of the test",
-                delay.as_secs_f64()
-            );
-            tokio::time::sleep(delay).await;
-        }
-
-        let timeout =
-            crate::config::parse_duration(&prometheus.timeout).unwrap_or(Duration::from_secs(15));
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
-            Ok(client) => client,
-            Err(error) => {
-                output.error(format!("cannot build Prometheus client: {error}"));
-                return step;
-            }
-        };
-
-        let queries = promql::plan(prometheus);
-        let token = self.prometheus_token.as_deref();
-        let results = join_all(queries.iter().map(|query| {
-            promql::run_query(
-                &client,
-                &prometheus.url,
-                token,
-                query,
-                run_start,
-                run_end,
-                step,
-            )
-        }))
-        .await;
-
-        let mut groups_with_data: BTreeMap<String, bool> = BTreeMap::new();
-        for (query, result) in queries.iter().zip(results) {
-            let label = format!("{}.{}", query.group, query.metric);
-            let has_data = groups_with_data.entry(query.group.clone()).or_default();
-            match result {
-                Ok(buffers) if buffers.is_empty() => missing.push(label),
-                Ok(buffers) => {
-                    *has_data = true;
-                    for buffer in buffers {
-                        output.store.insert(buffer);
-                    }
-                }
-                Err(error) => {
-                    output.error(format!("Prometheus query for {label} failed: {error:#}"))
-                }
-            }
-        }
-        for target in &prometheus.targets {
-            if groups_with_data.get(&target.name) == Some(&false) {
-                output.error(format!(
-                    "Prometheus returned no data for target '{}' (selector '{}') during the test \
-                     window; check the selector and that Prometheus scrapes the exporter",
-                    target.name, target.selector
-                ));
-            }
-        }
-        if !missing.is_empty() {
-            warn!(
-                "{} Prometheus queries returned no data; see 'missing' in the report",
-                missing.len()
-            );
-        }
-        step
     }
 
     fn groups(&self) -> Vec<ResourceGroup> {
@@ -520,17 +423,6 @@ impl ResourceMonitor {
         if self.config.host {
             groups.push(group(HOST_GROUP, "host", "host"));
         }
-        if let Some(prometheus) = &self.config.prometheus {
-            for target in &prometheus.targets {
-                groups.push(group(&target.name, target.kind.group_kind(), "prometheus"));
-            }
-            for query in &prometheus.queries {
-                let name = query.group.clone().unwrap_or_else(|| "custom".to_string());
-                if !groups.iter().any(|existing| existing.name == name) {
-                    groups.push(group(&name, "custom", "prometheus"));
-                }
-            }
-        }
         for target in &self.config.scrape {
             groups.push(group(&target.name, target.kind.group_kind(), "scrape"));
         }
@@ -543,6 +435,44 @@ impl Drop for ResourceMonitor {
         // A run that exits before `finish` must not leave the sampler behind.
         self.stop.cancel();
     }
+}
+
+/// Fetch a scrape body, refusing anything larger than `MAX_SCRAPE_BYTES`.
+async fn fetch(client: &reqwest::Client, url: &str, token: Option<&str>) -> anyhow::Result<String> {
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    // reqwest's messages name the URL; the target is named by the caller.
+    let mut response = request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(reqwest::Error::without_url)?;
+    let too_large = || {
+        anyhow::anyhow!(
+            "response is larger than {} MiB; narrow what the exporter publishes",
+            MAX_SCRAPE_BYTES / (1024 * 1024)
+        )
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SCRAPE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
+        if body.len() + chunk.len() > MAX_SCRAPE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Take one sample of every live source.
@@ -558,33 +488,60 @@ async fn sample_once(
         }
     }
 
-    let responses = join_all(scrape_targets.iter().map(|(target, token)| {
-        let mut request = client.get(target.config.url.trim());
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        async move {
-            let response = request.send().await?.error_for_status()?;
-            let text = response.text().await?;
-            Ok::<(f64, String), reqwest::Error>((now_secs(), text))
-        }
+    let responses = join_all(scrape_targets.iter().map(|(target, token)| async move {
+        let started = Instant::now();
+        let body = fetch(client, target.config.url.trim(), token.as_deref()).await;
+        (body, started.elapsed())
     }))
     .await;
 
-    for ((target, _), response) in scrape_targets.iter_mut().zip(responses) {
-        match response {
-            Ok((time, text)) => {
-                if let Some(note) = target.observe(time, &text, &mut output.store) {
+    for ((target, _), (body, fetch_time)) in scrape_targets.iter_mut().zip(responses) {
+        let text = match body {
+            Ok(text) => text,
+            Err(error) => {
+                output.error(format!(
+                    "scraping '{}' failed: {error:#}",
+                    target.config.name
+                ));
+                continue;
+            }
+        };
+        let time = now_secs();
+        let size_kib = text.len() as f64 / 1024.0;
+
+        // Parsing costs CPU in proportion to the scrape size, so it runs on
+        // the blocking pool instead of the runtime threads driving the load.
+        let families = scrape::families(target.config.kind);
+        let matchers = target.matchers().to_vec();
+        let parse_started = Instant::now();
+        let samples =
+            tokio::task::spawn_blocking(move || scrape::extract(&text, families, &matchers)).await;
+        let cost_ms = (fetch_time + parse_started.elapsed()).as_secs_f64() * 1000.0;
+
+        match samples {
+            Ok(samples) => {
+                if let Some(note) = target.observe_samples(time, &samples, &mut output.store) {
                     output.error(note);
                 }
             }
             Err(error) => output.error(format!(
-                "scraping '{}' failed: {}",
-                target.config.name,
-                // reqwest's message names the URL; strip the query so only
-                // the endpoint is reported.
-                error.without_url()
+                "parsing the scrape of '{}' failed: {error}",
+                target.config.name
             )),
+        }
+        let name = target.config.name.as_str();
+        for (metric, unit, value) in [
+            ("scrape_ms", "ms", cost_ms),
+            ("scrape_kib", "KiB", size_kib),
+        ] {
+            output.store.record(
+                series::SeriesKey::new(name, metric),
+                "scrape",
+                unit,
+                SeriesKind::Gauge,
+                time,
+                value,
+            );
         }
     }
 }
@@ -799,6 +756,35 @@ fn warnings(report: &ResourceReport) -> Vec<String> {
         }
     }
 
+    for group in report
+        .groups
+        .iter()
+        .filter(|group| group.source == "scrape")
+    {
+        let name = &group.name;
+        if let Some(cost) = summary_of(report, &format!("{name}.scrape_ms")) {
+            let budget_ms = report.interval_secs * 1000.0 * SCRAPE_TIME_WARN_SHARE;
+            if cost.avg >= budget_ms {
+                warnings.push(format!(
+                    "Scraping '{name}' took {:.0} ms on average, over a quarter of the {:.0}s \
+                     interval; the exporter is working hard on the machine under test. Raise \
+                     monitoring.interval or trim what the exporter publishes.",
+                    cost.avg, report.interval_secs
+                ));
+            }
+        }
+        if let Some(size) = summary_of(report, &format!("{name}.scrape_kib")) {
+            if size.avg >= SCRAPE_SIZE_WARN_KIB {
+                warnings.push(format!(
+                    "Each scrape of '{name}' was {:.1} MiB on average, mostly metrics Flux does \
+                     not read. For cAdvisor, use --docker_only, --store_container_labels=false \
+                     and --enable_metrics=cpu,memory,network,diskIO,oom_event,process.",
+                    size.avg / 1024.0
+                ));
+            }
+        }
+    }
+
     for host in &derived.hosts {
         let name = &host.group;
         if let (Some(core), Some(core_avg), Some(cpu)) = (
@@ -832,7 +818,7 @@ fn warnings(report: &ResourceReport) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::metrics::MetricsCollector;
-    use config::{PrometheusSourceConfig, PrometheusTargetConfig, ScrapeTargetConfig, TargetKind};
+    use config::{ScrapeTargetConfig, TargetKind};
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1012,27 +998,42 @@ mod tests {
         assert!(ResourceMonitor::start(&config).unwrap().is_none());
     }
 
+    fn scrape_target(
+        name: &str,
+        kind: TargetKind,
+        url: String,
+        selector: &str,
+    ) -> ScrapeTargetConfig {
+        ScrapeTargetConfig {
+            name: name.to_string(),
+            kind,
+            url,
+            selector: selector.to_string(),
+            per_core: true,
+            bearer_token_env: None,
+        }
+    }
+
     #[test]
     fn test_missing_token_variable_fails_before_the_run() {
+        let mut target = scrape_target(
+            "api",
+            TargetKind::Cadvisor,
+            "http://127.0.0.1:1/metrics".to_string(),
+            "",
+        );
+        target.bearer_token_env = Some("FLUX_TEST_TOKEN_THAT_IS_NOT_SET".to_string());
         let config = MonitoringConfig {
-            prometheus: Some(PrometheusSourceConfig {
-                url: "http://127.0.0.1:1".to_string(),
-                bearer_token_env: Some("FLUX_TEST_TOKEN_THAT_IS_NOT_SET".to_string()),
-                step: None,
-                rate_window: "30s".to_string(),
-                query_delay: "0s".to_string(),
-                timeout: "1s".to_string(),
-                targets: vec![],
-                queries: vec![],
-            }),
+            scrape: vec![target],
             ..Default::default()
         };
         let error = ResourceMonitor::start(&config).err().unwrap().to_string();
         assert!(error.contains("FLUX_TEST_TOKEN_THAT_IS_NOT_SET"));
     }
 
-    /// Minimal HTTP server standing in for both cAdvisor (`/metrics`) and
-    /// Prometheus (`/api/v1/query_range`).
+    /// Minimal HTTP server standing in for cAdvisor (`/cadvisor`) and
+    /// node_exporter (`/node`). Counters grow by one per scrape; requests for
+    /// `/huge` advertise a body over the size cap.
     async fn mock_exporters() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1047,53 +1048,31 @@ mod tests {
                     let mut buffer = vec![0u8; 16 * 1024];
                     let read = stream.read(&mut buffer).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-                    let url = reqwest::Url::parse(&format!("http://x{target}")).unwrap();
-                    let body = if url.path() == "/metrics" {
-                        // CPU usage grows by one CPU-second per scrape.
-                        let n = scrapes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        format!(
-                            "container_cpu_usage_seconds_total{{name=\"api\",cpu=\"total\"}} {}\n\
-                             container_memory_working_set_bytes{{name=\"api\"}} 268435456\n",
-                            n
-                        )
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let n = scrapes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = match path.as_str() {
+                        "/cadvisor" => format!(
+                            "# HELP container_cpu_usage_seconds_total cpu\n\
+                             container_cpu_usage_seconds_total{{name=\"api\",cpu=\"total\"}} {n}\n\
+                             container_cpu_usage_seconds_total{{name=\"other\",cpu=\"total\"}} 9999\n\
+                             container_memory_usage_bytes{{name=\"api\"}} 1\n\
+                             container_memory_working_set_bytes{{name=\"api\"}} 268435456\n"
+                        ),
+                        "/node" => format!(
+                            "node_cpu_seconds_total{{cpu=\"0\",mode=\"idle\"}} {n}\n\
+                             node_cpu_seconds_total{{cpu=\"0\",mode=\"user\"}} {n}\n\
+                             node_memory_MemTotal_bytes 1000\n\
+                             node_memory_MemAvailable_bytes 250\n"
+                        ),
+                        _ => String::new(),
+                    };
+                    let length = if path == "/huge" {
+                        MAX_SCRAPE_BYTES + 1
                     } else {
-                        let params: BTreeMap<String, String> =
-                            url.query_pairs().into_owned().collect();
-                        let query = params.get("query").cloned().unwrap_or_default();
-                        let start: f64 = params["start"].parse().unwrap();
-                        let end: f64 = params["end"].parse().unwrap();
-                        let step: f64 = params["step"].parse().unwrap();
-                        let value = if query.contains("container_cpu_usage_seconds_total")
-                            && !query.contains("container_spec_cpu_quota")
-                        {
-                            Some("0.5")
-                        } else if query.contains("container_memory_working_set_bytes")
-                            && !query.contains("limit")
-                        {
-                            Some("256")
-                        } else {
-                            None
-                        };
-                        let result = match value {
-                            Some(value) => {
-                                let mut points = Vec::new();
-                                let mut t = start;
-                                while t <= end + 1e-9 {
-                                    points.push(format!("[{t},\"{value}\"]"));
-                                    t += step;
-                                }
-                                format!("[{{\"metric\":{{}},\"values\":[{}]}}]", points.join(","))
-                            }
-                            None => "[]".to_string(),
-                        };
-                        format!(
-                            "{{\"status\":\"success\",\"data\":{{\"resultType\":\"matrix\",\"result\":{result}}}}}"
-                        )
+                        body.len()
                     };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+                        "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
@@ -1103,40 +1082,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monitor_end_to_end_with_prometheus_and_scrape() {
+    async fn test_monitor_end_to_end_with_cadvisor_and_node_exporter() {
         let base = mock_exporters().await;
         let config = MonitoringConfig {
-            interval: "500ms".to_string(),
-            prometheus: Some(PrometheusSourceConfig {
-                url: base.clone(),
-                bearer_token_env: None,
-                step: Some("1s".to_string()),
-                rate_window: "30s".to_string(),
-                query_delay: "0s".to_string(),
-                timeout: "5s".to_string(),
-                targets: vec![PrometheusTargetConfig {
-                    name: "api".to_string(),
-                    kind: TargetKind::Cadvisor,
-                    selector: r#"name="api""#.to_string(),
-                    per_core: true,
-                }],
-                queries: vec![],
-            }),
-            scrape: vec![ScrapeTargetConfig {
-                name: "api-direct".to_string(),
-                kind: TargetKind::Cadvisor,
-                url: format!("{base}/metrics"),
-                selector: r#"name="api""#.to_string(),
-                per_core: true,
-                bearer_token_env: None,
-            }],
+            interval: "1s".to_string(),
+            scrape: vec![
+                scrape_target(
+                    "api",
+                    TargetKind::Cadvisor,
+                    format!("{base}/cadvisor"),
+                    r#"name="api""#,
+                ),
+                scrape_target("node", TargetKind::Node, format!("{base}/node"), ""),
+            ],
             ..Default::default()
         };
         config.validate().unwrap();
 
         let collector = MetricsCollector::new();
         let monitor = ResourceMonitor::start(&config).unwrap().unwrap();
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
         let mut summary = collector.generate_summary();
         summary.measured_requests = 100;
         summary.measured_duration_secs = summary.total_duration_secs;
@@ -1154,75 +1119,93 @@ mod tests {
             .containers
             .iter()
             .find(|container| container.group == "api")
-            .expect("prometheus container");
-        assert_eq!(api.cpu_cores.as_ref().unwrap().avg, 0.5);
+            .expect("cAdvisor container");
         assert_eq!(api.memory_working_set_mib.as_ref().unwrap().max, 256.0);
+        assert!(api.cpu_cores.is_some());
         assert!(api.cpu_ms_per_request.is_some());
-        // Every other preset query came back empty and is listed, not failed.
-        assert!(report
-            .missing
-            .contains(&"api.cpu_throttled_percent".to_string()));
-        assert_eq!(report.prometheus_step_secs, Some(1.0));
 
-        let direct = report
+        let node = report
             .derived
-            .containers
+            .hosts
             .iter()
-            .find(|container| container.group == "api-direct")
-            .expect("scraped container");
-        assert_eq!(direct.memory_working_set_mib.as_ref().unwrap().max, 256.0);
-        assert!(direct.cpu_cores.is_some());
+            .find(|host| host.group == "node")
+            .expect("node_exporter host");
+        assert_eq!(node.memory_used_percent.as_ref().unwrap().max, 75.0);
+        assert!(report.series(r#"node.cpu_percent{cpu="0"}"#).is_some());
+
+        // The cost of every scrape is part of the report.
+        for id in ["api.scrape_ms", "api.scrape_kib", "node.scrape_ms"] {
+            assert!(report.series(id).is_some(), "missing {id}");
+        }
 
         if cfg!(target_os = "linux") {
             assert!(report.derived.loadgen.is_some());
             assert!(report.series("host.cpu_percent").is_some());
         }
         let group_names: Vec<&str> = report.groups.iter().map(|g| g.name.as_str()).collect();
-        assert_eq!(group_names, vec!["flux", "host", "api", "api-direct"]);
+        assert_eq!(group_names, vec!["flux", "host", "api", "node"]);
     }
 
     #[tokio::test]
-    async fn test_unreachable_sources_are_reported_not_fatal() {
+    async fn test_unreachable_and_oversized_sources_are_reported_not_fatal() {
+        let base = mock_exporters().await;
         let config = MonitoringConfig {
-            interval: "500ms".to_string(),
+            interval: "1s".to_string(),
             self_metrics: false,
             host: false,
-            prometheus: Some(PrometheusSourceConfig {
-                url: "http://127.0.0.1:1".to_string(),
-                bearer_token_env: None,
-                step: None,
-                rate_window: "30s".to_string(),
-                query_delay: "0s".to_string(),
-                timeout: "1s".to_string(),
-                targets: vec![],
-                queries: vec![config::CustomQueryConfig {
-                    name: "up".to_string(),
-                    query: "up".to_string(),
-                    unit: None,
-                    group: None,
-                }],
-            }),
-            scrape: vec![ScrapeTargetConfig {
-                name: "node".to_string(),
-                kind: TargetKind::Node,
-                url: "http://127.0.0.1:1/metrics".to_string(),
-                selector: String::new(),
-                per_core: true,
-                bearer_token_env: None,
-            }],
+            scrape: vec![
+                scrape_target(
+                    "node",
+                    TargetKind::Node,
+                    "http://127.0.0.1:1/metrics".to_string(),
+                    "",
+                ),
+                scrape_target("big", TargetKind::Cadvisor, format!("{base}/huge"), ""),
+            ],
             ..Default::default()
         };
         let collector = MetricsCollector::new();
         let monitor = ResourceMonitor::start(&config).unwrap().unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let report = monitor.finish(&collector.generate_summary()).await;
 
         assert!(report.series.is_empty());
         let errors = report.errors.join("\n");
         assert!(errors.contains("scraping 'node' failed"), "{errors}");
         assert!(
-            errors.contains("Prometheus query for custom.up failed"),
+            errors.contains("scraping 'big' failed") && errors.contains("larger than 32 MiB"),
             "{errors}"
         );
+    }
+
+    #[test]
+    fn test_warns_when_scraping_is_expensive() {
+        let mut report = ResourceReport {
+            interval_secs: 2.0,
+            groups: vec![ResourceGroup {
+                name: "api".to_string(),
+                kind: "container".to_string(),
+                source: "scrape".to_string(),
+            }],
+            series: vec![
+                series(
+                    "api",
+                    "scrape_ms",
+                    &[],
+                    summary_of_series(800.0, 900.0, 1_000.0),
+                ),
+                series(
+                    "api",
+                    "scrape_kib",
+                    &[],
+                    summary_of_series(8_192.0, 8_192.0, 8_192.0),
+                ),
+            ],
+            ..Default::default()
+        };
+        report.derived = derive(&report, &MetricsCollector::new().generate_summary());
+        let joined = warnings(&report).join("\n");
+        assert!(joined.contains("Scraping 'api' took 800 ms"), "{joined}");
+        assert!(joined.contains("8.0 MiB"), "{joined}");
     }
 }

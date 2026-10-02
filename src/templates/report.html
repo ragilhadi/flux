@@ -482,7 +482,7 @@
             <div class="chart-section">
                 <h2>🖥️ System Resources</h2>
                 <p class="muted">
-                    Sampled every {{ resources.interval_secs }}s{% if resources.prometheus_step_secs %}; Prometheus series at {{ resources.prometheus_step_secs }}s resolution{% endif %}.
+                    Sampled every {{ resources.interval_secs }}s.
                     Statistics cover {{ resources.summary_from_secs | round(precision=1) }}s to {{ resources.summary_to_secs | round(precision=1) }}s of the run (ramp-up excluded).
                 </p>
 
@@ -633,9 +633,6 @@
                         </tbody>
                     </table>
                 </div>
-                {% if resources.missing | length > 0 %}
-                <p class="muted">No data for: {{ resources.missing | join(sep=", ") }}. These exporters do not publish those metrics, which is common and harmless.</p>
-                {% endif %}
             </div>
             {% endif %}
 

@@ -906,12 +906,6 @@ impl Config {
         self.output.csv = expand_optional(self.output.csv.take())?;
         self.output.resources_csv = expand_optional(self.output.resources_csv.take())?;
         self.monitoring.interval = expand_environment_value(&self.monitoring.interval)?;
-        if let Some(prometheus) = &mut self.monitoring.prometheus {
-            prometheus.url = expand_environment_value(&prometheus.url)?;
-            for target in &mut prometheus.targets {
-                target.selector = expand_environment_value(&target.selector)?;
-            }
-        }
         for target in &mut self.monitoring.scrape {
             target.url = expand_environment_value(&target.url)?;
             target.selector = expand_environment_value(&target.selector)?;
@@ -2097,18 +2091,17 @@ output:
 
     #[test]
     fn test_monitoring_section_parses_with_env_expansion() {
-        std::env::set_var("FLUX_TEST_PROM_URL", "http://prometheus:9090");
+        std::env::set_var("FLUX_TEST_CADVISOR_HOST", "cadvisor:8080");
         let mut config: Config = serde_yaml::from_str(
             r#"
 target: "http://localhost"
 monitoring:
   interval: "1s"
-  prometheus:
-    url: "${FLUX_TEST_PROM_URL}"
-    targets:
-      - name: api
-        type: cadvisor
-        selector: 'name="api"'
+  scrape:
+    - name: api
+      type: cadvisor
+      url: "http://${FLUX_TEST_CADVISOR_HOST}/metrics"
+      selector: 'name="api"'
 output:
   json: o.json
   html: o.html
@@ -2119,8 +2112,8 @@ output:
         config.expand_environment_variables().unwrap();
         config.validate().unwrap();
         assert_eq!(
-            config.monitoring.prometheus.as_ref().unwrap().url,
-            "http://prometheus:9090"
+            config.monitoring.scrape[0].url,
+            "http://cadvisor:8080/metrics"
         );
         assert_eq!(config.output.resources_csv.as_deref(), Some("r.csv"));
     }
@@ -2133,7 +2126,7 @@ output:
         ] {
             let config = Config::from_file(&PathBuf::from(path))
                 .unwrap_or_else(|e| panic!("{path} failed to load: {e}"));
-            assert!(config.monitoring.prometheus.is_some(), "{path}");
+            assert!(!config.monitoring.scrape.is_empty(), "{path}");
         }
     }
 }

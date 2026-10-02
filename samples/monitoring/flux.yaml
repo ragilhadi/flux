@@ -10,17 +10,14 @@ load_profile:
 
 monitoring:
   interval: "2s"
-  prometheus:
-    url: "http://prometheus:9090"
-    step: "2s"
-    rate_window: "10s"
-    targets:
-      - name: api
-        type: cadvisor
-        selector: 'name="flux-demo-api"'
-      - name: node
-        type: node
-        selector: 'job="node-exporter"'
+  scrape:
+    - name: api
+      type: cadvisor
+      url: "http://cadvisor:8080/metrics"
+      selector: 'name="flux-demo-api"'
+    - name: node
+      type: node
+      url: "http://node-exporter:9100/metrics"
 
 assertions:
   max_p95_ms: 500

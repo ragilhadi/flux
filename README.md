@@ -22,7 +22,7 @@ Just Docker + YAML.
 - **Report comparison** with regression budgets for CI (`flux compare`)
 - **Real-time terminal display** with progress bars
 - **Opt-in live web dashboard** for watching a run from a browser
-- **System-resource monitoring**: load generator, host CPU per core, and target containers via cAdvisor / node_exporter / Prometheus, on the same time axis as latency
+- **System-resource monitoring**: load generator, host CPU per core, and target containers, scraped directly from cAdvisor / node_exporter (no Prometheus needed) on the same time axis as latency
 - **JSONPath extraction** for chaining requests
 - **Pure Docker usage** - no local installation needed
 - **High performance** - built with Rust for maximum throughput
@@ -709,15 +709,20 @@ same p95 means something different when the target sat at 40% CPU than when it
 was at 100% and being throttled. Flux records resource usage on the same time
 axis as the request timeline and puts it in every report.
 
+Flux reads the exporters directly. There is no Prometheus server or other
+storage to run: point it at cAdvisor and node_exporter and it does the rest.
+
 ### What is collected
 
 | Group | Source | Setup | Metrics |
 |-------|--------|-------|---------|
 | `flux` (load generator) | `/proc/self` | none, on by default | `cpu_cores`, `cpu_percent` (of the cores available to Flux, cgroup limit aware), `memory_rss_mib`, `threads`, `open_fds` |
 | `host` | `/proc/stat`, `/proc/meminfo` | none, on by default (Linux) | `cpu_percent` total and per core, `iowait_percent`, `steal_percent`, `memory_used_percent`, `memory_available_mib`, `load1` |
-| container targets | cAdvisor (via Prometheus or scraped directly) | `type: cadvisor` | `cpu_cores`, `cpu_percent_of_limit`, `cpu_throttled_percent`, `memory_working_set_mib`, `memory_rss_mib`, `memory_cache_mib`, `memory_percent_of_limit`, `network_rx/tx_mibps`, `network_errors_per_sec`, `fs_read/write_mibps`, `processes`, `open_fds`, `oom_events_total` |
-| node targets | node_exporter (via Prometheus or scraped directly) | `type: node` | `cpu_percent` total and per core, `iowait_percent`, `steal_percent`, `memory_used_percent`, `memory_available_mib`, `load1`, `tcp_retransmits_per_sec`, `tcp_sockets_inuse`, `tcp_time_wait`, `network_rx/tx_mibps`, `disk_busy_percent` |
-| anything else | custom PromQL | `queries:` | whatever the query returns, e.g. DB connections, GC pauses, JVM heap |
+| container targets | cAdvisor `/metrics` | `type: cadvisor` | `cpu_cores`, `cpu_percent_of_limit`, `cpu_throttled_percent`, `memory_working_set_mib`, `memory_rss_mib`, `memory_cache_mib`, `memory_percent_of_limit`, `network_rx/tx_mibps`, `network_errors_per_sec`, `fs_read/write_mibps`, `processes`, `open_fds`, `oom_events_total` |
+| node targets | node_exporter `/metrics` | `type: node` | `cpu_percent` total and per core, `iowait_percent`, `steal_percent`, `memory_used_percent`, `memory_available_mib`, `load1`, `tcp_retransmits_per_sec`, `tcp_sockets_inuse`, `tcp_time_wait`, `network_rx/tx_mibps`, `disk_busy_percent` |
+
+Every scrape target also gets `scrape_ms` and `scrape_kib`, which record what
+monitoring itself cost (see [Overhead](#overhead)).
 
 Watching Flux itself matters most: if the load generator is at 100% CPU, the
 latency you measured belongs to Flux, not to your service.
@@ -731,59 +736,103 @@ of each core one container used, not how busy each core was.
 ### Configuration
 
 Without a `monitoring` section, Flux samples itself and the local host every
-2s. Add a source to watch your target:
+2s. Add scrape targets to watch your service:
 
 ```yaml
 monitoring:
-  interval: "2s"           # sampling interval for /proc and scrape targets (min 500ms)
+  interval: "2s"           # sampling interval (min 500ms; min 1s with scrape targets)
   self: true               # load generator metrics
   host: true               # local host metrics
   per_core: true           # one host CPU series per core
-  prometheus:
-    url: "http://prometheus:9090"
-    bearer_token_env: "PROM_TOKEN"   # optional; read from the environment, never written to reports
-    step: "2s"             # series resolution (defaults to interval; widened to stay under ~700 points)
-    rate_window: "15s"     # rate() range: at least two scrapes of the exporter
-    query_delay: "5s"      # wait for the final scrape before querying
-    timeout: "15s"
-    targets:
-      - name: api
-        type: cadvisor
-        selector: 'name="api"'                      # Kubernetes: container="api",namespace="prod"
-      - name: node
-        type: node
-        selector: 'instance="node-exporter:9100"'
-        per_core: true
-    queries:
-      - name: db_connections
-        query: 'sum(pg_stat_activity_count{datname="app"})'
-        unit: count
-        group: db             # defaults to "custom"
-  scrape:                     # no Prometheus? scrape exporters directly
-    - name: api-direct
+  scrape:
+    - name: api
       type: cadvisor
       url: "http://cadvisor:8080/metrics"
-      selector: 'name="api"'  # only = and != when scraping directly
-      # bearer_token_env: "CADVISOR_TOKEN"
+      selector: 'name="api"'                     # Kubernetes kubelet: container="api",namespace="prod"
+    - name: node
+      type: node
+      url: "http://node-exporter:9100/metrics"
+      per_core: true
+      # bearer_token_env: "NODE_TOKEN"           # optional; read from the environment, never written to reports
 ```
 
-Set `monitoring.enabled: false` to collect nothing.
+`selector` takes `label="value"` and `label!="value"` matchers. Every
+container the selector matches is summed, so `container="api"` over three
+replicas reports the service as a whole. Set `monitoring.enabled: false` to
+collect nothing. Unknown keys in the `monitoring` section are rejected.
 
-**Prometheus** is queried once, after the run, with `/api/v1/query_range`
-over the test window. Nothing extra runs while the test is measuring, and any
-exporter Prometheus already scrapes (kubelet's cAdvisor, node_exporter,
-database exporters) works through the same integration. Use a short scrape
-interval (1–5s): a 15s default leaves only a handful of points in a short test.
-
-**Direct scraping** fetches the `/metrics` endpoint every `interval` and turns
-counters into rates locally, treating a counter that goes backwards (a
-container restart) as a reset. Run cAdvisor with
-`--housekeeping_interval=1s`; its default of about 10s is too coarse.
+Each interval Flux reads every exporter once and turns counters into rates
+from the difference between consecutive scrapes. A counter that goes backwards,
+as after a container restart, is treated as a reset rather than a negative
+rate.
 
 Monitoring never fails a run. A source that cannot be reached is listed under
 `resources.errors` and the test carries on. Configuration mistakes (a bad URL,
 an unset token variable, a duplicate target name) are rejected before any
 traffic is sent.
+
+### Overhead
+
+The exporters run on the machine under test, so monitoring must not compete
+with the target.
+
+**Inside Flux**, monitoring is one task that wakes once per interval:
+
+| Work | Cost per interval |
+|------|-------------------|
+| Load generator and host from `/proc` | about 60 µs |
+| A 3.8 MiB cAdvisor scrape (200 containers) | about 3.5 ms to extract the matching series |
+
+That is about 0.2% of one core at the default 2s interval. Three things keep
+it there:
+
+- Only the metric families Flux reads are parsed. Every other line is skipped
+  before its labels are touched, which is about 7× cheaper than parsing the
+  whole scrape.
+- Labels are matched against the selector without allocating.
+- Parsing runs on Tokio's blocking pool, away from the runtime threads that
+  drive the load.
+
+Scrape bodies are capped at 32 MiB, and memory stays bounded: at most 720
+points per series and 512 series.
+
+**On the target machine**, trim the exporters to what Flux reads and give them
+hard limits:
+
+```yaml
+cadvisor:
+  command:
+    - --docker_only=true
+    - --store_container_labels=false
+    - --enable_metrics=cpu,memory,network,diskIO,oom_event,process
+    - --housekeeping_interval=2s           # match monitoring.interval; the default is 1s
+  deploy: { resources: { limits: { cpus: "0.5", memory: 256M } } }
+
+node-exporter:
+  command:
+    - --collector.disable-defaults
+    - --collector.cpu
+    - --collector.meminfo
+    - --collector.loadavg
+    - --collector.netstat
+    - --collector.sockstat
+    - --collector.netdev
+    - --collector.diskstats
+    - --web.disable-exporter-metrics
+  deploy: { resources: { limits: { cpus: "0.2", memory: 64M } } }
+```
+
+Two numbers in every report show whether that worked:
+
+- `<target>.scrape_ms`: how long each scrape took, fetch plus parse;
+- `<target>.scrape_kib`: how large each scrape was.
+
+Flux warns when scraping takes more than a quarter of the interval, or when
+scrapes average over 4 MiB.
+
+Keep Flux itself off the machine under test when you can. The `flux` group
+shows what the load generator costs, and the warning at 85% CPU tells you when
+it became the bottleneck.
 
 ### What you get
 
@@ -801,7 +850,8 @@ traffic is sent.
   - memory at or above 90% of its limit, and any OOM kill;
   - steady memory growth (a possible leak);
   - one core pinned while the host is mostly idle;
-  - CPU steal at or above 10%.
+  - CPU steal at or above 10%;
+  - expensive scraping.
 - **Reports**:
   - JSON: `summary.resources`;
   - terminal: a "System Resources" section;
@@ -814,10 +864,11 @@ traffic is sent.
 ### Try it
 
 `samples/monitoring/` holds a docker-compose stack: an nginx target with CPU
-and memory limits, cAdvisor, node_exporter, Prometheus (2s scrapes) and Flux:
+and memory limits, cAdvisor and node_exporter trimmed and capped as above, and
+Flux:
 
 ```bash
-docker compose -f samples/monitoring/docker-compose.yml up -d api cadvisor node-exporter prometheus
+docker compose -f samples/monitoring/docker-compose.yml up -d api cadvisor node-exporter
 docker compose -f samples/monitoring/docker-compose.yml run --rm flux
 ```
 
@@ -1135,7 +1186,7 @@ See the `samples/` directory for complete examples:
 - `scenario-auth.yaml` - Multi-step authentication flow
 - `live-dashboard.yaml` - Run with the live web dashboard enabled
 - `system-monitoring.yaml` - Monitor target containers and hosts, with resource assertions
-- `monitoring/` - docker-compose stack with cAdvisor, node_exporter and Prometheus
+- `monitoring/` - docker-compose stack with cAdvisor and node_exporter, trimmed for low overhead
 
 ---
 
@@ -1158,8 +1209,7 @@ flux/
 │   │   ├── mod.rs           # Sampler task, report types, derived metrics, warnings
 │   │   ├── config.rs        # `monitoring` configuration
 │   │   ├── procfs.rs        # Load generator and host metrics from /proc
-│   │   ├── promql.rs        # Prometheus query_range source and presets
-│   │   ├── scrape.rs        # Direct /metrics scraping (cAdvisor, node_exporter)
+│   │   ├── scrape.rs        # cAdvisor / node_exporter /metrics scraping
 │   │   ├── series.rs        # Bounded series storage and statistics
 │   │   └── view.rs          # HTML/CSV presentation of resource data
 │   ├── prometheus.rs        # Live Prometheus endpoint

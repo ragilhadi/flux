@@ -690,7 +690,7 @@ mod tests {
                 ResourceGroup {
                     name: "api".to_string(),
                     kind: "container".to_string(),
-                    source: "prometheus".to_string(),
+                    source: "scrape".to_string(),
                 },
             ],
             series: vec![
@@ -716,7 +716,6 @@ mod tests {
             },
             warnings: vec!["'api' is CPU-bound.".to_string()],
             errors: vec!["scraping 'node' failed".to_string()],
-            missing: vec!["api.processes".to_string()],
             ..Default::default()
         });
         summary
@@ -734,7 +733,6 @@ mod tests {
         assert!(html.contains("host · CPU per core (%)"));
         assert!(html.contains("cpu0") && html.contains("cpu1"));
         assert!(html.contains("p95 latency vs api cpu_cores"));
-        assert!(html.contains("api.processes"));
         // Exporter-provided labels cannot break out of the script element.
         assert!(!html.contains("</script><script>alert(1)"));
         assert!(html.contains("\\u003c/script>"));

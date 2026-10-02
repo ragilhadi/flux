@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 /// pairwise, so a soak test of any length stays within a fixed budget.
 pub const MAX_POINTS_PER_SERIES: usize = 720;
 
-/// Most distinct series kept. A custom query that fans out into thousands of
-/// label combinations is truncated rather than allowed to exhaust memory.
+/// Most distinct series kept, bounding memory and report size whatever the
+/// number of cores on the monitored hosts.
 pub const MAX_SERIES: usize = 512;
 
 /// Whether a series is a level (gauge) or an ever-growing total (counter).
@@ -189,23 +189,6 @@ impl SeriesStore {
                 points: Vec::new(),
             });
         buffer.push(Point::new(time, value));
-    }
-
-    /// Insert a whole series at once (Prometheus range queries), downsampling
-    /// it to the point budget.
-    pub fn insert(&mut self, mut buffer: SeriesBuffer) {
-        if !self.series.contains_key(&buffer.key) && self.series.len() >= MAX_SERIES {
-            self.dropped_series += 1;
-            return;
-        }
-        buffer.points.retain(|point| point.value.is_finite());
-        while buffer.points.len() > MAX_POINTS_PER_SERIES {
-            buffer.points = downsample(&buffer.points, buffer.kind);
-        }
-        if buffer.points.is_empty() {
-            return;
-        }
-        self.series.insert(buffer.key.clone(), buffer);
     }
 
     #[cfg(test)]
@@ -471,7 +454,7 @@ mod tests {
         for i in 0..(MAX_SERIES + 5) {
             store.record(
                 SeriesKey::new("custom", "q").with_label("i", &i.to_string()),
-                "prometheus",
+                "scrape",
                 "",
                 SeriesKind::Gauge,
                 0.0,
@@ -480,7 +463,7 @@ mod tests {
         }
         store.record(
             SeriesKey::new("custom", "nan"),
-            "prometheus",
+            "scrape",
             "",
             SeriesKind::Gauge,
             0.0,
@@ -494,7 +477,7 @@ mod tests {
     fn test_finish_reports_offsets_relative_to_run_start() {
         let buffer = SeriesBuffer {
             key: SeriesKey::new("api", "memory_working_set_mib"),
-            source: "prometheus".to_string(),
+            source: "scrape".to_string(),
             unit: "MiB".to_string(),
             kind: SeriesKind::Gauge,
             points: points(&[(1_000.0, 1.0), (1_002.5, 2.0)]),
