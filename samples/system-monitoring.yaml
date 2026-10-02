@@ -1,0 +1,46 @@
+# System-resource monitoring example
+#
+# The load generator and the host it runs on are always monitored (from
+# /proc). This sample adds a target container (cAdvisor) and its host
+# (node_exporter), scraped directly by Flux, and fails the run when the
+# target saturates. See samples/monitoring/ for a docker-compose stack with
+# both exporters trimmed down to what Flux reads.
+target: "http://api:8080/health"
+method: "GET"
+
+load_profile:
+  type: stages
+  stages:
+    - { duration: "30s", target_concurrency: 10 }
+    - { duration: "1m", target_concurrency: 50 }
+    - { duration: "1m", target_concurrency: 100 }
+
+monitoring:
+  interval: "2s"           # how often /proc and the exporters are sampled (min 1s with scrape targets)
+  self: true               # Flux's own CPU, memory, threads, file descriptors
+  host: true               # host CPU (total + per core), memory, load average
+  per_core: true
+  scrape:
+    - name: api
+      type: cadvisor
+      url: "http://cadvisor:8080/metrics"
+      selector: 'name="api"'               # Kubernetes kubelet: container="api",namespace="prod"
+    - name: node
+      type: node
+      url: "http://node-exporter:9100/metrics"
+      per_core: true
+      # bearer_token_env: "NODE_TOKEN"     # token read from this env var
+
+assertions:
+  max_p95_ms: 300
+  max_error_rate: 1.0
+  max_cpu_percent: 85            # p95 of the container's CPU limit
+  max_throttled_percent: 5       # p95 share of throttled CFS periods
+  max_memory_percent: 90         # peak share of the memory limit
+  max_oom_events: 0
+  max_loadgen_cpu_percent: 85    # fail when Flux itself was the bottleneck
+
+output:
+  json: "/app/results/monitoring.json"
+  html: "/app/results/monitoring.html"
+  resources_csv: "/app/results/resources.csv"

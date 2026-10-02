@@ -758,12 +758,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
                 html: "/app/results/output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
 
@@ -935,12 +937,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
         let metrics = Arc::new(MetricsCollector::new());
@@ -1026,12 +1030,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         }
     }

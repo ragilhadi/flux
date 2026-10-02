@@ -162,6 +162,87 @@
             color: #999;
             font-size: 0.85em;
         }
+
+        .chart-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+            gap: 20px;
+        }
+
+        .chart-grid .chart-container {
+            height: 280px;
+            margin-bottom: 0;
+        }
+
+        .chart-grid h3 {
+            font-size: 1em;
+            color: #555;
+            margin: 0 0 8px 4px;
+        }
+
+        .notice {
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 10px;
+        }
+
+        .notice.warning {
+            background: #fff7e6;
+            border-left: 4px solid #f59e0b;
+        }
+
+        .notice.failure {
+            background: #fef2f2;
+            border-left: 4px solid #ef4444;
+        }
+
+        .muted {
+            color: #888;
+            font-size: 0.9em;
+        }
+
+        .table-scroll {
+            overflow-x: auto;
+        }
+
+        .heatmap {
+            border-collapse: collapse;
+            font-size: 0.75em;
+            margin-bottom: 20px;
+        }
+
+        .heatmap td,
+        .heatmap th {
+            padding: 2px 4px;
+            text-align: center;
+            min-width: 18px;
+            white-space: nowrap;
+        }
+
+        .heatmap th {
+            color: #888;
+            font-weight: 400;
+        }
+
+        .heatmap td.core {
+            text-align: right;
+            color: #555;
+            padding-right: 8px;
+        }
+
+        @media (max-width: 600px) {
+            body {
+                padding: 8px;
+            }
+
+            .content {
+                padding: 16px;
+            }
+
+            .chart-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
@@ -386,13 +467,174 @@
                 </div>
             </div>
 
-            <!-- Latency Over Time Chart -->
+            <!-- Throughput and Latency Over Time -->
             <div class="chart-section">
-                <h2>⏱️ Latency Over Time</h2>
+                <h2>⏱️ Throughput &amp; Latency Over Time</h2>
+                <p class="muted">Each point covers {{ summary.timeline_bucket_secs }}s of the run and every request in it. Per-point percentiles are accurate to within about 5%.</p>
                 <div class="chart-container">
                     <canvas id="latencyTimeChart"></canvas>
                 </div>
             </div>
+
+            {% if summary.resources %}
+            {% set resources = summary.resources %}
+            <!-- System Resources -->
+            <div class="chart-section">
+                <h2>🖥️ System Resources</h2>
+                <p class="muted">
+                    Sampled every {{ resources.interval_secs }}s.
+                    Statistics cover {{ resources.summary_from_secs | round(precision=1) }}s to {{ resources.summary_to_secs | round(precision=1) }}s of the run (ramp-up excluded).
+                </p>
+
+                {% for warning in resources.warnings %}
+                <div class="notice warning">⚠️ {{ warning }}</div>
+                {% endfor %}
+                {% for failure in resources.errors %}
+                <div class="notice failure">✗ {{ failure }}</div>
+                {% endfor %}
+
+                <div class="summary-grid">
+                    {% if resources.derived.loadgen %}
+                    {% if resources.derived.loadgen.cpu_percent %}
+                    <div class="metric-card">
+                        <h3>Load generator CPU (p95)</h3>
+                        <div class="value {% if resources.derived.loadgen.cpu_percent.p95 >= 85 %}error{% endif %}">{{ resources.derived.loadgen.cpu_percent.p95 | round(precision=1) }}<span class="unit">%</span></div>
+                    </div>
+                    {% endif %}
+                    {% endif %}
+                    {% for host in resources.derived.hosts %}
+                    {% if host.cpu_percent %}
+                    <div class="metric-card">
+                        <h3>{{ host.group }} CPU (avg / p95)</h3>
+                        <div class="value">{{ host.cpu_percent.avg | round(precision=1) }}<span class="unit">/ {{ host.cpu_percent.p95 | round(precision=1) }}%</span></div>
+                    </div>
+                    {% endif %}
+                    {% endfor %}
+                    {% for container in resources.derived.containers %}
+                    {% if container.cpu_cores %}
+                    <div class="metric-card">
+                        <h3>{{ container.group }} CPU (avg / p95)</h3>
+                        <div class="value">{{ container.cpu_cores.avg | round(precision=2) }}<span class="unit">/ {{ container.cpu_cores.p95 | round(precision=2) }} cores</span></div>
+                    </div>
+                    {% endif %}
+                    {% if container.memory_working_set_mib %}
+                    <div class="metric-card">
+                        <h3>{{ container.group }} memory (peak)</h3>
+                        <div class="value">{{ container.memory_working_set_mib.max | round(precision=1) }}<span class="unit">MiB</span></div>
+                    </div>
+                    {% endif %}
+                    {% if container.cpu_ms_per_request %}
+                    <div class="metric-card">
+                        <h3>{{ container.group }} CPU per request</h3>
+                        <div class="value">{{ container.cpu_ms_per_request | round(precision=2) }}<span class="unit">ms</span></div>
+                    </div>
+                    {% endif %}
+                    {% endfor %}
+                </div>
+
+                {% if resource_view.correlation %}
+                <h3>{{ resource_view.correlation.title }}</h3>
+                <div class="chart-container">
+                    <canvas id="correlationChart"></canvas>
+                </div>
+                {% endif %}
+
+                <div class="chart-grid">
+                    {% for chart in resource_view.charts %}
+                    <div>
+                        <h3>{{ chart.title }}</h3>
+                        <div class="chart-container">
+                            <canvas id="resourceChart{{ loop.index0 }}"></canvas>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+
+            {% for heatmap in resource_view.heatmaps %}
+            <div class="chart-section">
+                <h2>🔥 {{ heatmap.title }}</h2>
+                <div class="table-scroll">
+                    <table class="heatmap">
+                        <thead>
+                            <tr>
+                                <th></th>
+                                {% for column in heatmap.columns %}<th>{% if loop.index0 % 10 == 0 %}{{ column }}{% endif %}</th>{% endfor %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in heatmap.rows %}
+                            <tr>
+                                <td class="core">{{ row.label }}</td>
+                                {% for cell in row.cells %}<td style="background: rgba(239, 68, 68, {{ cell.alpha }})" title="{{ row.label }} @ {{ heatmap.columns[loop.index0] }}: {% if cell.value is number %}{{ cell.value }}%{% else %}no data{% endif %}"></td>{% endfor %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            {% endfor %}
+
+            {% if resource_view.stage_table %}
+            <div class="chart-section">
+                <h2>📶 Resources per Stage (avg / max)</h2>
+                <div class="table-scroll">
+                    <table class="percentiles-table">
+                        <thead>
+                            <tr>
+                                <th>Stage</th>
+                                {% for header in resource_view.stage_table.headers %}<th>{{ header }}</th>{% endfor %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in resource_view.stage_table.rows %}
+                            <tr>
+                                <td>{{ row.label }}</td>
+                                {% for cell in row.cells %}<td>{{ cell }}</td>{% endfor %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            {% endif %}
+
+            <div class="chart-section">
+                <h2>📋 Resource Summary</h2>
+                <div class="table-scroll">
+                    <table class="percentiles-table">
+                        <thead>
+                            <tr>
+                                <th>Group</th>
+                                <th>Metric</th>
+                                <th>Unit</th>
+                                <th>Avg</th>
+                                <th>P95</th>
+                                <th>Max</th>
+                                <th>Last</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in resource_view.rows %}
+                            <tr>
+                                <td>{{ row.group }}</td>
+                                <td>{{ row.metric }}</td>
+                                <td>{{ row.unit }}</td>
+                                {% if row.increase is number %}
+                                <td colspan="4">+{{ row.increase | round(precision=2) }} during the run</td>
+                                {% else %}
+                                <td>{{ row.avg | round(precision=2) }}</td>
+                                <td>{{ row.p95 | round(precision=2) }}</td>
+                                <td>{{ row.max | round(precision=2) }}</td>
+                                <td>{{ row.last | round(precision=2) }}</td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            {% endif %}
 
             <!-- Status Code Distribution -->
             <div class="chart-section">
@@ -440,37 +682,129 @@
             }
         });
 
-        // Latency Over Time Chart
+        // Throughput and Latency Over Time Chart
+        const timeline = {{ timeline_json | safe }};
+        const timeAxis = {
+            type: 'linear',
+            title: { display: true, text: 'seconds since start' },
+            ticks: { callback: (value) => value + 's' }
+        };
         const timeCtx = document.getElementById('latencyTimeChart').getContext('2d');
         new Chart(timeCtx, {
             type: 'line',
             data: {
-                labels: [{% for i in range(end=latency_data | length) %}{{ i }}{% if not loop.last %}, {% endif %}{% endfor %}],
-                datasets: [{
-                    label: 'Latency (ms)',
-                    data: [{% for latency in latency_data %}{{ latency }}{% if not loop.last %}, {% endif %}{% endfor %}],
-                    borderColor: 'rgba(102, 126, 234, 1)',
-                    backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    tension: 0.4
-                }]
+                datasets: [
+                    {
+                        label: 'p95 latency (ms)',
+                        data: timeline.map(p => ({ x: p.offset_secs, y: p.p95_latency_ms })),
+                        borderColor: 'rgba(239, 68, 68, 1)',
+                        backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        yAxisID: 'latency'
+                    },
+                    {
+                        label: 'mean latency (ms)',
+                        data: timeline.map(p => ({ x: p.offset_secs, y: p.mean_latency_ms })),
+                        borderColor: 'rgba(102, 126, 234, 1)',
+                        backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        yAxisID: 'latency'
+                    },
+                    {
+                        label: 'throughput (req/s)',
+                        data: timeline.map(p => ({ x: p.offset_secs, y: p.throughput_rps })),
+                        borderColor: 'rgba(16, 185, 129, 1)',
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                        borderWidth: 2,
+                        borderDash: [6, 4],
+                        pointRadius: 0,
+                        yAxisID: 'rps'
+                    }
+                ]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {
-                    legend: {
-                        display: false
-                    }
-                },
+                interaction: { mode: 'index', intersect: false },
                 scales: {
-                    y: {
-                        beginAtZero: true
-                    }
+                    x: timeAxis,
+                    latency: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'ms' } },
+                    rps: { type: 'linear', position: 'right', beginAtZero: true, title: { display: true, text: 'req/s' }, grid: { drawOnChartArea: false } }
                 }
             }
         });
+
+        // System resource charts
+        const palette = ['#667eea', '#ef4444', '#10b981', '#f59e0b', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6'];
+        const resourceCharts = {{ resource_charts_json | safe }} || [];
+        resourceCharts.forEach((chart, index) => {
+            const canvas = document.getElementById('resourceChart' + index);
+            if (!canvas) return;
+            new Chart(canvas.getContext('2d'), {
+                type: 'line',
+                data: {
+                    datasets: chart.datasets.map((dataset, i) => ({
+                        label: dataset.label,
+                        data: dataset.points.map(([x, y]) => ({ x, y })),
+                        borderColor: palette[i % palette.length],
+                        backgroundColor: 'transparent',
+                        borderWidth: 2,
+                        pointRadius: 0
+                    }))
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        x: timeAxis,
+                        y: { beginAtZero: true, title: { display: true, text: chart.unit } }
+                    }
+                }
+            });
+        });
+
+        // Latency against the most relevant resource series
+        const correlation = {{ resource_correlation_json | safe }};
+        if (correlation && document.getElementById('correlationChart')) {
+            new Chart(document.getElementById('correlationChart').getContext('2d'), {
+                type: 'line',
+                data: {
+                    datasets: [
+                        {
+                            label: 'p95 latency (ms)',
+                            data: timeline.map(p => ({ x: p.offset_secs, y: p.p95_latency_ms })),
+                            borderColor: 'rgba(239, 68, 68, 1)',
+                            backgroundColor: 'transparent',
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            yAxisID: 'latency'
+                        }
+                    ].concat(correlation.datasets.map((dataset, i) => ({
+                        label: dataset.label + ' (' + correlation.unit + ')',
+                        data: dataset.points.map(([x, y]) => ({ x, y })),
+                        borderColor: palette[i % palette.length],
+                        backgroundColor: 'transparent',
+                        borderWidth: 2,
+                        borderDash: i === 0 ? [] : [6, 4],
+                        pointRadius: 0,
+                        yAxisID: 'resource'
+                    })))
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        x: timeAxis,
+                        latency: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'ms' } },
+                        resource: { type: 'linear', position: 'right', beginAtZero: true, title: { display: true, text: correlation.unit }, grid: { drawOnChartArea: false } }
+                    }
+                }
+            });
+        }
 
         // Status Code Distribution
         const statusCtx = document.getElementById('statusChart').getContext('2d');

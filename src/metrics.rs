@@ -12,6 +12,22 @@ const HISTOGRAM_MAX_MS: u64 = 300_000;
 /// Seconds of per-second history kept for the live dashboard trend charts.
 const TIMELINE_WINDOW_SECS: usize = 120;
 
+/// Most points the full-run timeline keeps. When a run outgrows it, adjacent
+/// buckets are merged pairwise and the bucket width doubles, so a soak test
+/// of any length costs the same bounded amount of memory.
+pub const RUN_TIMELINE_MAX_POINTS: usize = 720;
+
+/// Latencies below this many milliseconds get an exact bucket in the compact
+/// per-bucket histogram; larger ones fall into log-spaced buckets.
+const COMPACT_LINEAR_BUCKETS: usize = 64;
+
+/// Growth factor between log-spaced compact buckets, which bounds the
+/// relative error of a per-bucket percentile to about 5%.
+const COMPACT_LOG_GROWTH: f64 = 1.05;
+
+/// Log-spaced buckets needed to cover `COMPACT_LINEAR_BUCKETS..HISTOGRAM_MAX_MS`.
+const COMPACT_LOG_BUCKETS: usize = 175;
+
 /// Number of recent requests, and recent failures, kept for the live view.
 const RECENT_SAMPLE_SIZE: usize = 50;
 
@@ -67,6 +83,9 @@ struct CollectorState {
     /// Per-second history for the live trend charts, bounded to
     /// `TIMELINE_WINDOW_SECS` buckets.
     timeline: VecDeque<TimelineBucket>,
+    /// History of the whole run for the final report, bounded to
+    /// `RUN_TIMELINE_MAX_POINTS` buckets by widening them as the run grows.
+    run_timeline: RunTimeline,
     /// Most recent requests, bounded to `RECENT_SAMPLE_SIZE`.
     recent: VecDeque<RecentResult>,
     /// Most recent failures, bounded to `RECENT_SAMPLE_SIZE`.
@@ -126,6 +145,212 @@ struct TimelineBucket {
     failed: usize,
     latency_sum: u128,
     max_latency_ms: u64,
+}
+
+/// Small fixed-size latency histogram used for each full-run timeline bucket.
+///
+/// An HdrHistogram per bucket would cost tens of kilobytes each; this costs
+/// under a kilobyte, which is what makes keeping a percentile for every
+/// timeline bucket affordable. Values below `COMPACT_LINEAR_BUCKETS` are exact
+/// and larger values are accurate to within about 5%.
+#[derive(Debug, Clone)]
+struct CompactHistogram {
+    counts: Vec<u32>,
+}
+
+impl CompactHistogram {
+    fn new() -> Self {
+        Self {
+            counts: vec![0; COMPACT_LINEAR_BUCKETS + COMPACT_LOG_BUCKETS],
+        }
+    }
+
+    fn index(latency_ms: u64) -> usize {
+        if latency_ms < COMPACT_LINEAR_BUCKETS as u64 {
+            return latency_ms as usize;
+        }
+        let ratio = latency_ms as f64 / COMPACT_LINEAR_BUCKETS as f64;
+        let log_index = (ratio.ln() / COMPACT_LOG_GROWTH.ln()).floor() as usize;
+        COMPACT_LINEAR_BUCKETS + log_index.min(COMPACT_LOG_BUCKETS - 1)
+    }
+
+    /// Largest latency a bucket can hold.
+    fn upper_bound(index: usize) -> u64 {
+        if index < COMPACT_LINEAR_BUCKETS {
+            return index as u64;
+        }
+        let exponent = (index - COMPACT_LINEAR_BUCKETS + 1) as i32;
+        (COMPACT_LINEAR_BUCKETS as f64 * COMPACT_LOG_GROWTH.powi(exponent)).ceil() as u64 - 1
+    }
+
+    fn record(&mut self, latency_ms: u64) {
+        let slot = &mut self.counts[Self::index(latency_ms)];
+        *slot = slot.saturating_add(1);
+    }
+
+    fn merge(&mut self, other: &CompactHistogram) {
+        for (mine, theirs) in self.counts.iter_mut().zip(&other.counts) {
+            *mine = mine.saturating_add(*theirs);
+        }
+    }
+
+    /// Value at `quantile`, never above `max_latency_ms` (the true maximum
+    /// recorded), so a bucket's upper bound cannot overstate the tail.
+    fn value_at_quantile(&self, quantile: f64, max_latency_ms: u64) -> u64 {
+        let total: u64 = self.counts.iter().map(|&count| count as u64).sum();
+        if total == 0 {
+            return 0;
+        }
+        let rank = ((quantile * total as f64).ceil() as u64).clamp(1, total);
+        let mut seen = 0u64;
+        for (index, &count) in self.counts.iter().enumerate() {
+            seen += count as u64;
+            if seen >= rank {
+                return Self::upper_bound(index).min(max_latency_ms);
+            }
+        }
+        max_latency_ms
+    }
+}
+
+/// One bucket of the full-run timeline.
+#[derive(Debug, Clone)]
+struct RunBucket {
+    requests: usize,
+    failed: usize,
+    latency_sum: u128,
+    max_latency_ms: u64,
+    histogram: CompactHistogram,
+}
+
+impl RunBucket {
+    fn new() -> Self {
+        Self {
+            requests: 0,
+            failed: 0,
+            latency_sum: 0,
+            max_latency_ms: 0,
+            histogram: CompactHistogram::new(),
+        }
+    }
+
+    fn merge(&mut self, other: &RunBucket) {
+        self.requests += other.requests;
+        self.failed += other.failed;
+        self.latency_sum += other.latency_sum;
+        self.max_latency_ms = self.max_latency_ms.max(other.max_latency_ms);
+        self.histogram.merge(&other.histogram);
+    }
+}
+
+/// Throughput and latency history covering the whole run.
+///
+/// Buckets are aligned to the start of the run and start `bucket_secs` wide
+/// (one second). Once the run would need more than `RUN_TIMELINE_MAX_POINTS`
+/// buckets, neighbours are merged pairwise and the width doubles, so memory
+/// stays bounded however long the run is.
+#[derive(Debug)]
+struct RunTimeline {
+    /// When the first bucket starts.
+    origin: DateTime<Utc>,
+    bucket_secs: i64,
+    buckets: Vec<RunBucket>,
+}
+
+impl RunTimeline {
+    fn new(origin: DateTime<Utc>) -> Self {
+        Self {
+            origin,
+            bucket_secs: 1,
+            buckets: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, result: &RequestResult) {
+        // Results are attributed to the bucket they completed in; anything
+        // reported before the run started (clock skew) lands in the first
+        // bucket rather than being lost.
+        let offset_ms = result
+            .request_end_timestamp
+            .signed_duration_since(self.origin)
+            .num_milliseconds()
+            .max(0);
+        let mut index = (offset_ms / (self.bucket_secs * 1_000)) as usize;
+        while index >= RUN_TIMELINE_MAX_POINTS {
+            self.widen();
+            index = (offset_ms / (self.bucket_secs * 1_000)) as usize;
+        }
+        if self.buckets.len() <= index {
+            self.buckets.resize_with(index + 1, RunBucket::new);
+        }
+
+        let bucket = &mut self.buckets[index];
+        bucket.requests += 1;
+        bucket.failed += usize::from(result.error.is_some());
+        bucket.latency_sum += result.latency_ms as u128;
+        bucket.max_latency_ms = bucket.max_latency_ms.max(result.latency_ms);
+        bucket.histogram.record(result.latency_ms);
+    }
+
+    /// Double the bucket width, merging neighbouring buckets pairwise.
+    fn widen(&mut self) {
+        self.bucket_secs *= 2;
+        let merged = self
+            .buckets
+            .chunks(2)
+            .map(|pair| {
+                let mut bucket = pair[0].clone();
+                if let Some(second) = pair.get(1) {
+                    bucket.merge(second);
+                }
+                bucket
+            })
+            .collect();
+        self.buckets = merged;
+    }
+
+    /// Render the timeline for a run that ended at `end`.
+    fn points(&self, end: DateTime<Utc>) -> Vec<RunTimelinePoint> {
+        let run_secs = end.signed_duration_since(self.origin).num_milliseconds() as f64 / 1000.0;
+
+        self.buckets
+            .iter()
+            .enumerate()
+            .map(|(index, bucket)| {
+                let offset_secs = (index as i64 * self.bucket_secs) as f64;
+                // The last bucket is usually cut short by the end of the run,
+                // so its rate is taken over the part the run covered.
+                let covered = (run_secs - offset_secs).clamp(0.0, self.bucket_secs as f64);
+                let covered = if covered > 0.001 {
+                    covered
+                } else {
+                    self.bucket_secs as f64
+                };
+
+                RunTimelinePoint {
+                    offset_secs,
+                    timestamp: self.origin
+                        + chrono::Duration::milliseconds((offset_secs * 1_000.0) as i64),
+                    duration_secs: self.bucket_secs as f64,
+                    requests: bucket.requests,
+                    failed: bucket.failed,
+                    throughput_rps: bucket.requests as f64 / covered,
+                    mean_latency_ms: if bucket.requests == 0 {
+                        0.0
+                    } else {
+                        bucket.latency_sum as f64 / bucket.requests as f64
+                    },
+                    p95_latency_ms: bucket
+                        .histogram
+                        .value_at_quantile(0.95, bucket.max_latency_ms),
+                    p99_latency_ms: bucket
+                        .histogram
+                        .value_at_quantile(0.99, bucket.max_latency_ms),
+                    max_latency_ms: bucket.max_latency_ms,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Streaming statistics for a set of requests.
@@ -209,6 +434,40 @@ pub struct MetricsSummary {
     /// order. Empty for a plain fixed-concurrency run.
     #[serde(default)]
     pub stages: Vec<StageSummary>,
+    /// Throughput and latency over the whole run, oldest first. Each point
+    /// covers `timeline_bucket_secs` seconds; long runs use wider buckets so
+    /// the series never exceeds `RUN_TIMELINE_MAX_POINTS` points. Reports
+    /// written before this field existed simply omit it.
+    #[serde(default)]
+    pub timeline: Vec<RunTimelinePoint>,
+    /// Width of each `timeline` point, in seconds.
+    #[serde(default)]
+    pub timeline_bucket_secs: u64,
+    /// System resource usage observed during the run (load generator, host,
+    /// target containers), when monitoring was enabled. Reports written
+    /// before monitoring existed simply omit it.
+    #[serde(default)]
+    pub resources: Option<crate::monitoring::ResourceReport>,
+}
+
+/// One point of the full-run throughput and latency timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunTimelinePoint {
+    /// Seconds from the start of the run to the start of this point.
+    pub offset_secs: f64,
+    /// Wall-clock start of this point.
+    pub timestamp: DateTime<Utc>,
+    pub duration_secs: f64,
+    pub requests: usize,
+    pub failed: usize,
+    pub throughput_rps: f64,
+    pub mean_latency_ms: f64,
+    /// Approximate (within about 5%) p95 of the requests completed in this
+    /// point; the run-wide percentiles above are exact.
+    pub p95_latency_ms: u64,
+    /// Approximate (within about 5%) p99 of the requests in this point.
+    pub p99_latency_ms: u64,
+    pub max_latency_ms: u64,
 }
 
 /// Configured-versus-achieved load for the whole run.
@@ -243,6 +502,10 @@ pub struct StageSummary {
     /// startup — reports the rate it actually achieved.
     #[serde(default)]
     pub observed_duration_secs: f64,
+    /// Seconds from the start of the run to when this stage began, so stage
+    /// boundaries can be lined up with the timeline and system metrics.
+    #[serde(default)]
+    pub started_offset_secs: f64,
     pub metrics: ScenarioMetricsSummary,
 }
 
@@ -520,6 +783,7 @@ impl MetricsCollector {
         max_stored_results: usize,
         csv_sink: Option<Sender<RequestResult>>,
     ) -> Self {
+        let start_time = Utc::now();
         Self {
             state: Arc::new(Mutex::new(CollectorState {
                 results: Vec::new(),
@@ -530,6 +794,7 @@ impl MetricsCollector {
                 skipped_scenarios: BTreeMap::new(),
                 status_codes: BTreeMap::new(),
                 timeline: VecDeque::new(),
+                run_timeline: RunTimeline::new(start_time),
                 recent: VecDeque::new(),
                 recent_failures: VecDeque::new(),
                 csv_sink,
@@ -539,7 +804,7 @@ impl MetricsCollector {
                 per_stage: BTreeMap::new(),
                 current_stage: None,
             })),
-            start_time: Utc::now(),
+            start_time,
             max_stored_results,
         }
     }
@@ -661,6 +926,7 @@ impl MetricsCollector {
                 .observe(&result);
         }
         state.observe_timeline(&result);
+        state.run_timeline.observe(&result);
         state.observe_recent(&result);
         if state
             .load_phase
@@ -885,6 +1151,12 @@ impl MetricsCollector {
                     target_rps: meta.target_rps,
                     planned_duration_secs: meta.planned_duration_secs,
                     observed_duration_secs,
+                    started_offset_secs: (meta
+                        .started_at
+                        .signed_duration_since(self.start_time)
+                        .num_milliseconds() as f64
+                        / 1000.0)
+                        .max(0.0),
                     metrics,
                 }
             })
@@ -928,6 +1200,9 @@ impl MetricsCollector {
             csv_dropped_rows: state.csv_dropped_rows,
             load_profile,
             stages,
+            timeline: state.run_timeline.points(end_time),
+            timeline_bucket_secs: state.run_timeline.bucket_secs as u64,
+            resources: None,
         }
     }
 
@@ -1470,5 +1745,93 @@ mod tests {
         assert_eq!(summary.stages.len(), 1);
         assert_eq!(summary.stages[0].target_rps, Some(100.0));
         assert_eq!(summary.stages[0].metrics.total_requests, 2);
+    }
+
+    fn result_at(end: DateTime<Utc>, latency_ms: u64, failed: bool) -> RequestResult {
+        RequestResult {
+            scenario_name: None,
+            latency_ms,
+            status_code: if failed { 500 } else { 200 },
+            error: failed.then(|| "boom".to_string()),
+            request_start_timestamp: end,
+            request_end_timestamp: end,
+        }
+    }
+
+    #[test]
+    fn test_compact_histogram_is_exact_for_small_values_and_close_for_large() {
+        let mut histogram = CompactHistogram::new();
+        for latency in 1..=40 {
+            histogram.record(latency);
+        }
+        assert_eq!(histogram.value_at_quantile(0.95, 40), 38);
+        assert_eq!(histogram.value_at_quantile(1.0, 40), 40);
+
+        let mut histogram = CompactHistogram::new();
+        for _ in 0..100 {
+            histogram.record(1_000);
+        }
+        let p95 = histogram.value_at_quantile(0.95, 5_000);
+        assert!((1_000..=1_050).contains(&p95), "p95 {p95} not within 5%");
+        // Never reported above the true maximum.
+        assert_eq!(histogram.value_at_quantile(0.95, 1_000), 1_000);
+        // Values beyond the histogram range still land in the last bucket.
+        histogram.record(HISTOGRAM_MAX_MS * 10);
+        assert_eq!(CompactHistogram::new().value_at_quantile(0.5, 0), 0);
+    }
+
+    #[test]
+    fn test_run_timeline_buckets_requests_by_second() {
+        let start = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut timeline = RunTimeline::new(start);
+        let second = chrono::Duration::seconds(1);
+        timeline.observe(&result_at(start, 10, false));
+        timeline.observe(&result_at(start, 30, true));
+        timeline.observe(&result_at(start + second * 2, 100, false));
+
+        let points = timeline.points(start + second * 3);
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0].requests, 2);
+        assert_eq!(points[0].failed, 1);
+        assert_eq!(points[0].mean_latency_ms, 20.0);
+        assert_eq!(points[0].p95_latency_ms, 30);
+        assert_eq!(points[0].throughput_rps, 2.0);
+        // An idle second is still a point, so gaps show up on the chart.
+        assert_eq!(points[1].requests, 0);
+        assert_eq!(points[2].offset_secs, 2.0);
+        assert_eq!(points[2].max_latency_ms, 100);
+    }
+
+    #[test]
+    fn test_run_timeline_widens_to_stay_bounded() {
+        let start = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut timeline = RunTimeline::new(start);
+        let seconds = (RUN_TIMELINE_MAX_POINTS * 3) as i64;
+        for offset in 0..seconds {
+            timeline.observe(&result_at(
+                start + chrono::Duration::seconds(offset),
+                5,
+                false,
+            ));
+        }
+        assert!(timeline.buckets.len() <= RUN_TIMELINE_MAX_POINTS);
+        assert_eq!(timeline.bucket_secs, 4);
+        let points = timeline.points(start + chrono::Duration::seconds(seconds));
+        let total: usize = points.iter().map(|point| point.requests).sum();
+        assert_eq!(total, seconds as usize);
+        assert_eq!(points[1].offset_secs, 4.0);
+        assert_eq!(points[1].throughput_rps, 1.0);
+    }
+
+    #[test]
+    fn test_summary_carries_the_full_run_timeline() {
+        let collector = MetricsCollector::new();
+        collector.record(result(None, 12, None));
+        collector.record(result(None, 18, Some("boom")));
+        let summary = collector.generate_summary();
+        assert_eq!(summary.timeline_bucket_secs, 1);
+        let total: usize = summary.timeline.iter().map(|point| point.requests).sum();
+        assert_eq!(total, 2);
+        assert!(summary.resources.is_none());
     }
 }

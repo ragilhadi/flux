@@ -1,5 +1,6 @@
 use crate::compare::REPORT_SCHEMA_VERSION;
 use crate::metrics::{MetricsSummary, RequestResult};
+use crate::monitoring::view;
 use anyhow::Result;
 use serde::Serialize;
 use std::fs;
@@ -81,19 +82,49 @@ impl Reporter {
         context.insert("results", &self.report.results);
 
         // Prepare data for charts
-        let latency_data: Vec<u64> = self.report.results.iter().map(|r| r.latency_ms).collect();
-
         let status_codes: Vec<u16> = self.report.results.iter().map(|r| r.status_code).collect();
 
         // Calculate latency distribution
         let latency_distribution = self.calculate_latency_distribution();
 
-        context.insert("latency_data", &latency_data);
         context.insert("status_codes", &status_codes);
+        context.insert(
+            "timeline_json",
+            &view::script_json(&self.report.summary.timeline)?,
+        );
+
+        let resource_view = self
+            .report
+            .summary
+            .resources
+            .as_ref()
+            .map(|resources| view::build(&self.report.summary, resources));
+        context.insert(
+            "resource_charts_json",
+            &view::script_json(&resource_view.as_ref().map(|view| &view.charts))?,
+        );
+        context.insert(
+            "resource_correlation_json",
+            &view::script_json(
+                &resource_view
+                    .as_ref()
+                    .and_then(|view| view.correlation.as_ref()),
+            )?,
+        );
+        context.insert("resource_view", &resource_view);
         context.insert("latency_distribution", &latency_distribution);
 
         let html = tera.render("report.html", &context)?;
         Ok(html)
+    }
+
+    /// Write the resource-monitoring samples as CSV. Returns the row count;
+    /// a run without monitoring writes only the header.
+    pub fn generate_resources_csv(&self, output_path: &str) -> Result<usize> {
+        ensure_parent_directory(output_path)?;
+        let empty = crate::monitoring::ResourceReport::default();
+        let resources = self.report.summary.resources.as_ref().unwrap_or(&empty);
+        view::write_csv(output_path, &self.report.summary, resources)
     }
 
     /// Calculate latency distribution for histogram
@@ -282,6 +313,9 @@ mod tests {
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
 
         let reporter = Reporter::new(summary, results);
@@ -367,6 +401,9 @@ mod tests {
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
         let path = std::env::temp_dir().join(format!(
             "flux-report-{}-{}.json",
@@ -429,6 +466,9 @@ mod tests {
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
         let reporter = Reporter::new(summary, Vec::new());
 
@@ -468,6 +508,9 @@ mod tests {
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
         let reporter = Reporter::new(summary, Vec::new());
 
@@ -506,6 +549,9 @@ mod tests {
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
         let reporter = Reporter::new(summary, Vec::new());
 
@@ -570,8 +616,12 @@ mod tests {
                 target_rps: Some(30.0),
                 planned_duration_secs: 2.0,
                 observed_duration_secs: 2.0,
+                started_offset_secs: 0.0,
                 metrics: stage_metrics,
             }],
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
         let reporter = Reporter::new(summary, Vec::new());
 
@@ -580,5 +630,143 @@ mod tests {
         assert!(html.contains("arrival_rate"));
         assert!(html.contains("Per-Stage Metrics"));
         assert!(html.contains("Arrival rate (30.00 req/s)"));
+    }
+
+    fn report_with_resources() -> MetricsSummary {
+        use crate::monitoring::{
+            ContainerResources, DerivedResources, ResourceGroup, ResourceReport, ResourceSeries,
+            SeriesSummary,
+        };
+
+        let collector = crate::metrics::MetricsCollector::new();
+        collector.record(RequestResult {
+            scenario_name: None,
+            latency_ms: 25,
+            status_code: 200,
+            error: None,
+            request_start_timestamp: Utc::now(),
+            request_end_timestamp: Utc::now(),
+        });
+        let mut summary = collector.generate_summary();
+        summary.total_duration_secs = 10.0;
+
+        let stat = SeriesSummary {
+            samples: 3,
+            min: 0.5,
+            avg: 1.0,
+            p95: 1.5,
+            max: 1.5,
+            first: 0.5,
+            last: 1.5,
+            ..Default::default()
+        };
+        let series = |group: &str, metric: &str, unit: &str, labels: &[(&str, &str)]| {
+            let labels: std::collections::BTreeMap<String, String> = labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let mut key = crate::monitoring::series::SeriesKey::new(group, metric);
+            key.labels = labels.clone();
+            ResourceSeries {
+                id: key.id(),
+                group: group.to_string(),
+                metric: metric.to_string(),
+                labels,
+                source: "test".to_string(),
+                unit: unit.to_string(),
+                kind: "gauge".to_string(),
+                points: vec![[0.0, 50.0], [5.0, 100.0]],
+                summary: stat.clone(),
+            }
+        };
+        summary.resources = Some(ResourceReport {
+            interval_secs: 2.0,
+            groups: vec![
+                ResourceGroup {
+                    name: "host".to_string(),
+                    kind: "host".to_string(),
+                    source: "host".to_string(),
+                },
+                ResourceGroup {
+                    name: "api".to_string(),
+                    kind: "container".to_string(),
+                    source: "scrape".to_string(),
+                },
+            ],
+            series: vec![
+                series("host", "cpu_percent", "percent", &[]),
+                series("host", "cpu_percent", "percent", &[("cpu", "0")]),
+                series("host", "cpu_percent", "percent", &[("cpu", "1")]),
+                series("api", "cpu_cores", "cores", &[]),
+                series(
+                    "api",
+                    "custom",
+                    "count",
+                    &[("path", "</script><script>alert(1)</script>")],
+                ),
+            ],
+            derived: DerivedResources {
+                containers: vec![ContainerResources {
+                    group: "api".to_string(),
+                    cpu_cores: Some(stat.clone()),
+                    cpu_ms_per_request: Some(4.25),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            warnings: vec!["'api' is CPU-bound.".to_string()],
+            errors: vec!["scraping 'node' failed".to_string()],
+            ..Default::default()
+        });
+        summary
+    }
+
+    #[test]
+    fn test_html_contains_resource_section() {
+        let reporter = Reporter::new(report_with_resources(), Vec::new());
+        let html = reporter.render_html().unwrap();
+
+        assert!(html.contains("System Resources"));
+        assert!(html.contains("&#39;api&#39; is CPU-bound."));
+        assert!(html.contains("scraping"));
+        assert!(html.contains("api CPU per request"));
+        assert!(html.contains("host · CPU per core (%)"));
+        assert!(html.contains("cpu0") && html.contains("cpu1"));
+        assert!(html.contains("p95 latency vs api cpu_cores"));
+        // Exporter-provided labels cannot break out of the script element.
+        assert!(!html.contains("</script><script>alert(1)"));
+        assert!(html.contains("\\u003c/script>"));
+    }
+
+    #[test]
+    fn test_html_without_resources_has_no_resource_section() {
+        let mut summary = report_with_resources();
+        summary.resources = None;
+        let html = Reporter::new(summary, Vec::new()).render_html().unwrap();
+        assert!(!html.contains("System Resources"));
+        assert!(html.contains("Throughput &amp; Latency Over Time"));
+    }
+
+    #[test]
+    fn test_resources_csv_has_one_row_per_sample() {
+        let path = std::env::temp_dir().join(format!(
+            "flux-resources-{}-{}.csv",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let reporter = Reporter::new(report_with_resources(), Vec::new());
+        let rows = reporter
+            .generate_resources_csv(path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(rows, 10);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        assert_eq!(
+            lines.next(),
+            Some("timestamp,offset_secs,group,source,metric,labels,unit,value")
+        );
+        assert!(contents.contains(",host,test,cpu_percent,cpu=0,percent,50"));
+        fs::remove_file(&path).ok();
     }
 }

@@ -1,4 +1,6 @@
 use crate::metrics::MetricsSummary;
+use crate::monitoring::config::MonitoringConfig;
+use crate::monitoring::{ResourceReport, SeriesSummary};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -93,6 +95,13 @@ pub struct Config {
     /// Absent by default: no socket is opened unless this section exists.
     #[serde(default)]
     pub live_dashboard: Option<LiveDashboardConfig>,
+
+    /// System-resource monitoring (load generator, host, target containers).
+    ///
+    /// On by default for the load generator and the local host, which need
+    /// no setup; targets are monitored only when a source is configured.
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
 
     /// Execution mode: "async" or "sync"
     #[serde(default = "default_mode")]
@@ -263,6 +272,53 @@ pub struct AssertionsConfig {
     pub max_p95_ms: Option<u64>,
     #[serde(default)]
     pub max_avg_ms: Option<f64>,
+
+    /// Highest p95 CPU usage of any target container, as a percent of its
+    /// CPU limit.
+    #[serde(default)]
+    pub max_cpu_percent: Option<f64>,
+    /// Highest p95 CPU usage of any target container, in cores (for
+    /// containers without a CPU limit).
+    #[serde(default)]
+    pub max_cpu_cores: Option<f64>,
+    /// Highest p95 share of CFS periods in which any target container was
+    /// throttled, in percent.
+    #[serde(default)]
+    pub max_throttled_percent: Option<f64>,
+    /// Highest peak memory of any target container, as a percent of its limit.
+    #[serde(default)]
+    pub max_memory_percent: Option<f64>,
+    /// Highest peak working-set memory of any target container, in MiB.
+    #[serde(default)]
+    pub max_memory_mib: Option<f64>,
+    /// Highest memory growth rate of any target container, in MiB per minute
+    /// (evaluated only for measured windows of at least a minute).
+    #[serde(default)]
+    pub max_memory_growth_mib_per_min: Option<f64>,
+    /// Most OOM kills tolerated across target containers (usually 0).
+    #[serde(default)]
+    pub max_oom_events: Option<u64>,
+    /// Highest p95 CPU of the load generator, as a percent of the cores
+    /// available to it. Fails the run when Flux itself was the bottleneck.
+    #[serde(default)]
+    pub max_loadgen_cpu_percent: Option<f64>,
+    /// Highest p95 CPU of any monitored host (local or node_exporter).
+    #[serde(default)]
+    pub max_host_cpu_percent: Option<f64>,
+}
+
+impl AssertionsConfig {
+    fn has_resource_assertions(&self) -> bool {
+        self.max_cpu_percent.is_some()
+            || self.max_cpu_cores.is_some()
+            || self.max_throttled_percent.is_some()
+            || self.max_memory_percent.is_some()
+            || self.max_memory_mib.is_some()
+            || self.max_memory_growth_mib_per_min.is_some()
+            || self.max_oom_events.is_some()
+            || self.max_loadgen_cpu_percent.is_some()
+            || self.max_host_cpu_percent.is_some()
+    }
 }
 
 /// Response assertions for a scenario step.
@@ -294,6 +350,11 @@ pub struct OutputConfig {
     /// `0` to retain everything.
     #[serde(default = "default_max_results")]
     pub max_results: usize,
+
+    /// Optional CSV of every resource-monitoring sample, one row per
+    /// (series, timestamp), for spreadsheets, pandas or Grafana.
+    #[serde(default)]
+    pub resources_csv: Option<String>,
 }
 
 fn default_concurrency() -> usize {
@@ -391,7 +452,30 @@ impl Config {
             if assertions.max_avg_ms.is_some_and(|value| value < 0.0) {
                 anyhow::bail!("max_avg_ms cannot be negative");
             }
+            for (name, value) in [
+                ("max_cpu_percent", assertions.max_cpu_percent),
+                ("max_cpu_cores", assertions.max_cpu_cores),
+                ("max_throttled_percent", assertions.max_throttled_percent),
+                ("max_memory_percent", assertions.max_memory_percent),
+                ("max_memory_mib", assertions.max_memory_mib),
+                (
+                    "max_loadgen_cpu_percent",
+                    assertions.max_loadgen_cpu_percent,
+                ),
+                ("max_host_cpu_percent", assertions.max_host_cpu_percent),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                    anyhow::bail!("{name} must be a non-negative number");
+                }
+            }
+            if assertions.has_resource_assertions() && !self.monitoring.enabled {
+                anyhow::bail!(
+                    "resource assertions (max_cpu_percent, max_memory_mib, ...) need \
+                     monitoring to be enabled"
+                );
+            }
         }
+        self.monitoring.validate()?;
 
         // Validate multipart parts
         if let Some(ref parts) = self.multipart {
@@ -779,6 +863,10 @@ impl Config {
             }
         }
 
+        if assertions.has_resource_assertions() {
+            evaluate_resource_assertions(assertions, summary.resources.as_ref(), &mut failures);
+        }
+
         failures
     }
 
@@ -816,6 +904,12 @@ impl Config {
         self.output.json = expand_environment_value(&self.output.json)?;
         self.output.html = expand_environment_value(&self.output.html)?;
         self.output.csv = expand_optional(self.output.csv.take())?;
+        self.output.resources_csv = expand_optional(self.output.resources_csv.take())?;
+        self.monitoring.interval = expand_environment_value(&self.monitoring.interval)?;
+        for target in &mut self.monitoring.scrape {
+            target.url = expand_environment_value(&target.url)?;
+            target.selector = expand_environment_value(&target.selector)?;
+        }
 
         for scenario in &mut self.scenarios {
             scenario.name = expand_environment_value(&scenario.name)?;
@@ -842,7 +936,7 @@ impl Config {
     }
 }
 
-fn parse_duration(value: &str) -> anyhow::Result<Duration> {
+pub(crate) fn parse_duration(value: &str) -> anyhow::Result<Duration> {
     let duration = parse_duration_allow_zero(value)?;
     if duration.is_zero() {
         anyhow::bail!("Duration must be greater than zero");
@@ -850,7 +944,7 @@ fn parse_duration(value: &str) -> anyhow::Result<Duration> {
     Ok(duration)
 }
 
-fn parse_duration_allow_zero(value: &str) -> anyhow::Result<Duration> {
+pub(crate) fn parse_duration_allow_zero(value: &str) -> anyhow::Result<Duration> {
     let value = value.trim();
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
         (number, 1_u64)
@@ -894,6 +988,135 @@ fn validate_status_codes(statuses: &[u16], field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check the resource assertions against what monitoring observed.
+///
+/// An assertion that has nothing to check — no container was monitored, or
+/// the exporter publishes no limit — fails rather than passing silently: a
+/// quality gate that cannot see is not a gate.
+fn evaluate_resource_assertions(
+    assertions: &AssertionsConfig,
+    resources: Option<&ResourceReport>,
+    failures: &mut Vec<String>,
+) {
+    let Some(resources) = resources else {
+        failures.push(
+            "resource assertions could not be evaluated: no resource data was collected"
+                .to_string(),
+        );
+        return;
+    };
+    let derived = &resources.derived;
+
+    // Check `value(item)` against `max` for every item, failing when none has
+    // data.
+    let mut check = |name: &str,
+                     unit: &str,
+                     max: Option<f64>,
+                     values: Vec<(String, Option<f64>)>,
+                     what: &str| {
+        let Some(max) = max else { return };
+        let measured: Vec<(String, f64)> = values
+            .into_iter()
+            .filter_map(|(group, value)| value.map(|value| (group, value)))
+            .collect();
+        if measured.is_empty() {
+            failures.push(format!(
+                "{name} could not be evaluated: no {what} data was collected"
+            ));
+            return;
+        }
+        for (group, value) in measured {
+            if value > max {
+                failures.push(format!(
+                    "'{group}' {what} {value:.2}{unit} exceeds {name} {max:.2}{unit}"
+                ));
+            }
+        }
+    };
+    let containers = |get: fn(&crate::monitoring::ContainerResources) -> Option<f64>| {
+        derived
+            .containers
+            .iter()
+            .map(|container| (container.group.clone(), get(container)))
+            .collect::<Vec<_>>()
+    };
+    let p95 = |summary: &Option<SeriesSummary>| summary.as_ref().map(|summary| summary.p95);
+
+    check(
+        "max_cpu_percent",
+        "%",
+        assertions.max_cpu_percent,
+        containers(|c| c.cpu_percent_of_limit.as_ref().map(|s| s.p95)),
+        "p95 CPU (percent of limit)",
+    );
+    check(
+        "max_cpu_cores",
+        " cores",
+        assertions.max_cpu_cores,
+        containers(|c| c.cpu_cores.as_ref().map(|s| s.p95)),
+        "p95 CPU",
+    );
+    check(
+        "max_throttled_percent",
+        "%",
+        assertions.max_throttled_percent,
+        containers(|c| c.cpu_throttled_percent.as_ref().map(|s| s.p95)),
+        "p95 CPU throttling",
+    );
+    check(
+        "max_memory_percent",
+        "%",
+        assertions.max_memory_percent,
+        containers(|c| c.memory_percent_of_limit.as_ref().map(|s| s.max)),
+        "peak memory (percent of limit)",
+    );
+    check(
+        "max_memory_mib",
+        " MiB",
+        assertions.max_memory_mib,
+        containers(|c| c.memory_working_set_mib.as_ref().map(|s| s.max)),
+        "peak memory",
+    );
+    check(
+        "max_memory_growth_mib_per_min",
+        " MiB/min",
+        assertions.max_memory_growth_mib_per_min,
+        containers(|c| c.memory_growth_mib_per_min),
+        "memory growth",
+    );
+    check(
+        "max_oom_events",
+        "",
+        assertions.max_oom_events.map(|max| max as f64),
+        containers(|c| c.oom_events),
+        "OOM kills",
+    );
+    check(
+        "max_loadgen_cpu_percent",
+        "%",
+        assertions.max_loadgen_cpu_percent,
+        vec![(
+            crate::monitoring::config::LOADGEN_GROUP.to_string(),
+            derived
+                .loadgen
+                .as_ref()
+                .and_then(|loadgen| p95(&loadgen.cpu_percent)),
+        )],
+        "p95 load generator CPU",
+    );
+    check(
+        "max_host_cpu_percent",
+        "%",
+        assertions.max_host_cpu_percent,
+        derived
+            .hosts
+            .iter()
+            .map(|host| (host.group.clone(), p95(&host.cpu_percent)))
+            .collect(),
+        "p95 host CPU",
+    );
+}
+
 fn expand_optional(value: Option<String>) -> anyhow::Result<Option<String>> {
     value
         .map(|value| expand_environment_value(&value))
@@ -931,7 +1154,7 @@ fn expand_multipart(
         .transpose()
 }
 
-fn expand_environment_value(value: &str) -> anyhow::Result<String> {
+pub(crate) fn expand_environment_value(value: &str) -> anyhow::Result<String> {
     expand_with_lookup(value, |name| std::env::var(name).ok())
 }
 
@@ -989,12 +1212,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "/app/results/output.json".to_string(),
                 html: "/app/results/output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
 
@@ -1035,12 +1260,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "out.json".to_string(),
                 html: "out.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
         assert_eq!(config.parse_timeout().unwrap(), Duration::from_millis(250));
@@ -1084,12 +1311,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "original.json".to_string(),
                 html: "original.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
 
@@ -1132,12 +1361,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
 
@@ -1201,12 +1432,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         }
     }
@@ -1437,16 +1670,19 @@ output:
                 max_p99_ms: Some(500),
                 max_p95_ms: Some(300),
                 max_avg_ms: Some(200.0),
+                ..Default::default()
             }),
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         };
         let summary = MetricsSummary {
@@ -1476,6 +1712,9 @@ output:
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
 
         let failures = config.evaluate_assertions(&summary);
@@ -1765,5 +2004,129 @@ output:
         assert_eq!(target_rps, 200.0);
         assert_eq!(duration, Duration::from_secs(300));
         assert_eq!(max_concurrency, 500);
+    }
+
+    fn resource_config(assertions: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            "target: \"http://localhost\"\nassertions:\n{assertions}\noutput:\n  json: o.json\n  html: o.html\n"
+        ))
+        .unwrap()
+    }
+
+    fn stat(avg: f64, p95: f64, max: f64) -> Option<SeriesSummary> {
+        Some(SeriesSummary {
+            samples: 5,
+            avg,
+            p95,
+            max,
+            ..Default::default()
+        })
+    }
+
+    fn summary_with_resources(resources: Option<ResourceReport>) -> MetricsSummary {
+        let mut summary = crate::metrics::MetricsCollector::new().generate_summary();
+        summary.resources = resources;
+        summary
+    }
+
+    #[test]
+    fn test_resource_assertions_pass_and_fail() {
+        let config = resource_config(
+            "  max_cpu_percent: 80\n  max_memory_mib: 512\n  max_oom_events: 0\n  max_loadgen_cpu_percent: 90\n  max_host_cpu_percent: 95",
+        );
+        config.validate().unwrap();
+
+        let report = ResourceReport {
+            derived: crate::monitoring::DerivedResources {
+                loadgen: Some(crate::monitoring::LoadgenResources {
+                    cpu_percent: stat(50.0, 70.0, 99.0),
+                    ..Default::default()
+                }),
+                hosts: vec![crate::monitoring::HostResources {
+                    group: "host".to_string(),
+                    cpu_percent: stat(40.0, 60.0, 100.0),
+                    ..Default::default()
+                }],
+                containers: vec![crate::monitoring::ContainerResources {
+                    group: "api".to_string(),
+                    cpu_percent_of_limit: stat(60.0, 85.0, 99.0),
+                    memory_working_set_mib: stat(300.0, 400.0, 600.0),
+                    oom_events: Some(0.0),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        };
+        let failures = config.evaluate_assertions(&summary_with_resources(Some(report)));
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(failures[0]
+            .contains("'api' p95 CPU (percent of limit) 85.00% exceeds max_cpu_percent 80.00%"));
+        assert!(
+            failures[1].contains("'api' peak memory 600.00 MiB exceeds max_memory_mib 512.00 MiB")
+        );
+    }
+
+    #[test]
+    fn test_resource_assertions_without_data_fail_loudly() {
+        let config = resource_config("  max_throttled_percent: 5");
+        let failures = config.evaluate_assertions(&summary_with_resources(None));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("no resource data was collected"));
+
+        let failures =
+            config.evaluate_assertions(&summary_with_resources(Some(ResourceReport::default())));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("max_throttled_percent could not be evaluated"));
+    }
+
+    #[test]
+    fn test_resource_assertions_require_monitoring() {
+        let mut config = resource_config("  max_cpu_cores: 2");
+        config.monitoring.enabled = false;
+        assert!(config.validate().is_err());
+
+        let negative = resource_config("  max_memory_percent: -1");
+        assert!(negative.validate().is_err());
+    }
+
+    #[test]
+    fn test_monitoring_section_parses_with_env_expansion() {
+        std::env::set_var("FLUX_TEST_CADVISOR_HOST", "cadvisor:8080");
+        let mut config: Config = serde_yaml::from_str(
+            r#"
+target: "http://localhost"
+monitoring:
+  interval: "1s"
+  scrape:
+    - name: api
+      type: cadvisor
+      url: "http://${FLUX_TEST_CADVISOR_HOST}/metrics"
+      selector: 'name="api"'
+output:
+  json: o.json
+  html: o.html
+  resources_csv: r.csv
+"#,
+        )
+        .unwrap();
+        config.expand_environment_variables().unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.monitoring.scrape[0].url,
+            "http://cadvisor:8080/metrics"
+        );
+        assert_eq!(config.output.resources_csv.as_deref(), Some("r.csv"));
+    }
+
+    #[test]
+    fn test_monitoring_samples_load() {
+        for path in [
+            "samples/system-monitoring.yaml",
+            "samples/monitoring/flux.yaml",
+        ] {
+            let config = Config::from_file(&PathBuf::from(path))
+                .unwrap_or_else(|e| panic!("{path} failed to load: {e}"));
+            assert!(!config.monitoring.scrape.is_empty(), "{path}");
+        }
     }
 }
