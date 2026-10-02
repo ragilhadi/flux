@@ -5,6 +5,7 @@ mod config;
 mod dashboard;
 mod executor;
 mod metrics;
+mod monitoring;
 mod prometheus;
 mod redact;
 mod reporter;
@@ -18,6 +19,7 @@ use config::Config;
 use dashboard::LiveDashboard;
 use executor::Executor;
 use metrics::MetricsCollector;
+use monitoring::ResourceMonitor;
 use prometheus::PrometheusServer;
 use reporter::{CsvResultStream, Reporter};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -362,6 +364,17 @@ async fn main() -> Result<()> {
             }
         };
 
+    // Resource monitoring (load generator, host, target containers). It is
+    // started before the load so the first rate sample is ready when traffic
+    // begins.
+    let resource_monitor = match ResourceMonitor::start(&config.monitoring) {
+        Ok(monitor) => monitor,
+        Err(e) => {
+            ui.display_error(&format!("Failed to start resource monitoring: {e:#}"));
+            std::process::exit(1);
+        }
+    };
+
     // Start live metrics update task
     let metrics_clone = Arc::clone(&metrics);
     let ui_cancellation = cancellation.clone();
@@ -429,7 +442,11 @@ async fn main() -> Result<()> {
 
     // Generate summary
     info!("Generating summary");
-    let summary = metrics.generate_summary();
+    let mut summary = metrics.generate_summary();
+    if let Some(monitor) = resource_monitor {
+        info!("Collecting resource metrics");
+        summary.resources = Some(monitor.finish(&summary).await);
+    }
     let csv_dropped_rows = summary.csv_dropped_rows;
     let results = metrics.get_results();
     let assertion_failures = config.evaluate_assertions(&summary);
@@ -455,6 +472,13 @@ async fn main() -> Result<()> {
         error!("Failed to generate HTML report: {}", e);
     } else {
         ui.display_success(&format!("HTML report saved to: {}", config.output.html));
+    }
+
+    if let Some(path) = &config.output.resources_csv {
+        match reporter.generate_resources_csv(path) {
+            Ok(rows) => ui.display_success(&format!("Resource CSV saved to: {path} ({rows} rows)")),
+            Err(e) => error!("Failed to generate resource CSV: {}", e),
+        }
     }
 
     if let (Some(stream), Some(csv_path)) = (csv_stream, &config.output.csv) {

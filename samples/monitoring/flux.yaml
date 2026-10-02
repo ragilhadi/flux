@@ -1,0 +1,32 @@
+# Flux configuration for the docker-compose stack in this directory.
+target: "http://api:80/"
+method: "GET"
+
+load_profile:
+  type: stages
+  stages:
+    - { duration: "30s", target_concurrency: 10 }
+    - { duration: "1m", target_concurrency: 50 }
+
+monitoring:
+  interval: "2s"
+  prometheus:
+    url: "http://prometheus:9090"
+    step: "2s"
+    rate_window: "10s"
+    targets:
+      - name: api
+        type: cadvisor
+        selector: 'name="flux-demo-api"'
+      - name: node
+        type: node
+        selector: 'job="node-exporter"'
+
+assertions:
+  max_p95_ms: 500
+  max_loadgen_cpu_percent: 90
+
+output:
+  json: "/app/results/monitoring.json"
+  html: "/app/results/monitoring.html"
+  resources_csv: "/app/results/resources.csv"

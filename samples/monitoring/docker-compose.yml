@@ -1,0 +1,59 @@
+# Load test a sample service while cAdvisor, node_exporter and Prometheus
+# record what it costs. From the repository root:
+#
+#   docker compose -f samples/monitoring/docker-compose.yml up -d api cadvisor node-exporter prometheus
+#   docker compose -f samples/monitoring/docker-compose.yml run --rm flux
+#
+# Reports land in samples/monitoring/results/. cAdvisor and node_exporter need
+# read access to the host (Linux). On Docker Desktop (macOS, Windows) the
+# "host" is Docker's VM, so host numbers describe that VM.
+name: flux-monitoring-demo
+
+services:
+  api:
+    image: nginx:alpine
+    container_name: flux-demo-api
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    privileged: true
+    devices:
+      - /dev/kmsg
+    command:
+      # The default housekeeping interval (~10s) is too coarse for short tests.
+      - --housekeeping_interval=1s
+      - --docker_only=true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    pid: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9091:9090"
+
+  flux:
+    build: ../..
+    profiles: ["test"]
+    depends_on: [api, cadvisor, node-exporter, prometheus]
+    volumes:
+      - ./flux.yaml:/app/config.yaml:ro
+      - ./results:/app/results

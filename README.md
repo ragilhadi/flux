@@ -22,6 +22,7 @@ Just Docker + YAML.
 - **Report comparison** with regression budgets for CI (`flux compare`)
 - **Real-time terminal display** with progress bars
 - **Opt-in live web dashboard** for watching a run from a browser
+- **System-resource monitoring**: load generator, host CPU per core, and target containers via cAdvisor / node_exporter / Prometheus, on the same time axis as latency
 - **JSONPath extraction** for chaining requests
 - **Pure Docker usage** - no local installation needed
 - **High performance** - built with Rust for maximum throughput
@@ -497,6 +498,23 @@ skip is counted per step in the terminal summary, the JSON report
 
 Aggregate assertions support `max_error_rate`, `max_p95_ms`, `max_p99_ms`, and `max_avg_ms`. Failed assertions are printed after reports are generated and cause Flux to exit with status code 1.
 
+Resource assertions check what [monitoring](#-system-resource-monitoring) observed:
+
+| Field | Checks |
+|-------|--------|
+| `max_cpu_percent` | p95 CPU of each target container, as % of its CPU limit |
+| `max_cpu_cores` | p95 CPU of each target container, in cores |
+| `max_throttled_percent` | p95 share of CFS periods in which a container was throttled |
+| `max_memory_percent` | peak working-set memory, as % of the container's limit |
+| `max_memory_mib` | peak working-set memory, in MiB |
+| `max_memory_growth_mib_per_min` | working-set growth rate (measured windows of 1 minute or more) |
+| `max_oom_events` | OOM kills during the run |
+| `max_loadgen_cpu_percent` | p95 CPU of Flux itself, as % of the cores available to it |
+| `max_host_cpu_percent` | p95 CPU of each monitored host |
+
+An assertion with nothing to check (no container monitored, or no limit
+published) fails rather than passing silently.
+
 Scenario response assertions are recorded as request failures when the expected status or body content does not match.
 
 ### Report Outputs
@@ -507,6 +525,7 @@ Scenario response assertions are recorded as request failures when the expected 
 | `html` | string | Yes | - | HTML report path |
 | `csv` | string | No | - | Per-request CSV path, streamed to disk while the test runs |
 | `max_results` | integer | No | 10000 | Per-request rows kept in memory for the JSON/HTML reports (`0` keeps all) |
+| `resources_csv` | string | No | - | Every resource-monitoring sample, one row per series and timestamp |
 
 #### Memory Use on Long Runs
 
@@ -683,6 +702,130 @@ docker run --rm --name flux-run ... flux:latest
 docker stop flux-run     # SIGTERM: reports are still written
 ```
 
+## 🖥️ System-Resource Monitoring
+
+Latency and throughput say *what* happened; resource usage says *why*. The
+same p95 means something different when the target sat at 40% CPU than when it
+was at 100% and being throttled. Flux records resource usage on the same time
+axis as the request timeline and puts it in every report.
+
+### What is collected
+
+| Group | Source | Setup | Metrics |
+|-------|--------|-------|---------|
+| `flux` (load generator) | `/proc/self` | none, on by default | `cpu_cores`, `cpu_percent` (of the cores available to Flux, cgroup limit aware), `memory_rss_mib`, `threads`, `open_fds` |
+| `host` | `/proc/stat`, `/proc/meminfo` | none, on by default (Linux) | `cpu_percent` total and per core, `iowait_percent`, `steal_percent`, `memory_used_percent`, `memory_available_mib`, `load1` |
+| container targets | cAdvisor (via Prometheus or scraped directly) | `type: cadvisor` | `cpu_cores`, `cpu_percent_of_limit`, `cpu_throttled_percent`, `memory_working_set_mib`, `memory_rss_mib`, `memory_cache_mib`, `memory_percent_of_limit`, `network_rx/tx_mibps`, `network_errors_per_sec`, `fs_read/write_mibps`, `processes`, `open_fds`, `oom_events_total` |
+| node targets | node_exporter (via Prometheus or scraped directly) | `type: node` | `cpu_percent` total and per core, `iowait_percent`, `steal_percent`, `memory_used_percent`, `memory_available_mib`, `load1`, `tcp_retransmits_per_sec`, `tcp_sockets_inuse`, `tcp_time_wait`, `network_rx/tx_mibps`, `disk_busy_percent` |
+| anything else | custom PromQL | `queries:` | whatever the query returns, e.g. DB connections, GC pauses, JVM heap |
+
+Watching Flux itself matters most: if the load generator is at 100% CPU, the
+latency you measured belongs to Flux, not to your service.
+
+Inside a container, `/proc/stat` and `/proc/meminfo` describe the machine the
+container runs on, so the `host` group is that machine (on Docker Desktop, its
+VM). Per-core CPU of a remote machine comes from node_exporter: cAdvisor turns
+per-CPU metrics off by default, and even when they are on they show how much
+of each core one container used, not how busy each core was.
+
+### Configuration
+
+Without a `monitoring` section, Flux samples itself and the local host every
+2s. Add a source to watch your target:
+
+```yaml
+monitoring:
+  interval: "2s"           # sampling interval for /proc and scrape targets (min 500ms)
+  self: true               # load generator metrics
+  host: true               # local host metrics
+  per_core: true           # one host CPU series per core
+  prometheus:
+    url: "http://prometheus:9090"
+    bearer_token_env: "PROM_TOKEN"   # optional; read from the environment, never written to reports
+    step: "2s"             # series resolution (defaults to interval; widened to stay under ~700 points)
+    rate_window: "15s"     # rate() range: at least two scrapes of the exporter
+    query_delay: "5s"      # wait for the final scrape before querying
+    timeout: "15s"
+    targets:
+      - name: api
+        type: cadvisor
+        selector: 'name="api"'                      # Kubernetes: container="api",namespace="prod"
+      - name: node
+        type: node
+        selector: 'instance="node-exporter:9100"'
+        per_core: true
+    queries:
+      - name: db_connections
+        query: 'sum(pg_stat_activity_count{datname="app"})'
+        unit: count
+        group: db             # defaults to "custom"
+  scrape:                     # no Prometheus? scrape exporters directly
+    - name: api-direct
+      type: cadvisor
+      url: "http://cadvisor:8080/metrics"
+      selector: 'name="api"'  # only = and != when scraping directly
+      # bearer_token_env: "CADVISOR_TOKEN"
+```
+
+Set `monitoring.enabled: false` to collect nothing.
+
+**Prometheus** is queried once, after the run, with `/api/v1/query_range`
+over the test window. Nothing extra runs while the test is measuring, and any
+exporter Prometheus already scrapes (kubelet's cAdvisor, node_exporter,
+database exporters) works through the same integration. Use a short scrape
+interval (1–5s): a 15s default leaves only a handful of points in a short test.
+
+**Direct scraping** fetches the `/metrics` endpoint every `interval` and turns
+counters into rates locally, treating a counter that goes backwards (a
+container restart) as a reset. Run cAdvisor with
+`--housekeeping_interval=1s`; its default of about 10s is too coarse.
+
+Monitoring never fails a run. A source that cannot be reached is listed under
+`resources.errors` and the test carries on. Configuration mistakes (a bad URL,
+an unset token variable, a duplicate target name) are rejected before any
+traffic is sent.
+
+### What you get
+
+- **Summaries**: min / avg / p95 / max / last of every series over the measured
+  window (ramp-up excluded), with a linear trend per minute.
+- **Derived numbers**: CPU time per request (`cpu_ms_per_request`), requests
+  per core, memory growth in MiB/min, OOM kills, and the hottest core per host.
+- **Per-stage breakdown**: average and peak of each series during each stage of
+  a `stages` or `arrival_rate` profile, so you can see where the system starts
+  to saturate.
+- **Warnings** for:
+  - load generator CPU at or above 85%;
+  - a container at or above 90% of its CPU limit, or throttled in 5% or more
+    of scheduling periods;
+  - memory at or above 90% of its limit, and any OOM kill;
+  - steady memory growth (a possible leak);
+  - one core pinned while the host is mostly idle;
+  - CPU steal at or above 10%.
+- **Reports**:
+  - JSON: `summary.resources`;
+  - terminal: a "System Resources" section;
+  - HTML: a p95-latency-vs-CPU chart, one chart per group and unit, a per-core
+    CPU heatmap, a per-stage table and a summary table;
+  - `output.resources_csv`: one row per sample (`timestamp, offset_secs, group,
+    source, metric, labels, unit, value`), ready for pandas, a spreadsheet or
+    Grafana.
+
+### Try it
+
+`samples/monitoring/` holds a docker-compose stack: an nginx target with CPU
+and memory limits, cAdvisor, node_exporter, Prometheus (2s scrapes) and Flux:
+
+```bash
+docker compose -f samples/monitoring/docker-compose.yml up -d api cadvisor node-exporter prometheus
+docker compose -f samples/monitoring/docker-compose.yml run --rm flux
+```
+
+See `samples/system-monitoring.yaml` for a fully commented configuration with
+resource assertions.
+
+---
+
 ## 📈 Metrics Collected
 
 Flux collects comprehensive metrics for each request:
@@ -692,6 +835,8 @@ Flux collects comprehensive metrics for each request:
 - **Status codes** distribution
 - **Error rate** and error messages
 - **Request timestamps** for timeline analysis
+- **Full-run timeline** (`summary.timeline`): requests, failures, throughput, mean, p95, p99 and max latency per point. Points are 1s wide; on long runs they widen so there are never more than 720.
+- **System resources** (`summary.resources`): see [System-Resource Monitoring](#-system-resource-monitoring)
 - **Retention counters** (`retained_results` / `dropped_results`) when raw rows are capped
 
 ---
@@ -732,7 +877,8 @@ for requests that never got a response (connection errors, timeouts).
 Beautiful interactive report with:
 - Summary statistics cards
 - Latency distribution histogram
-- Latency over time line chart
+- Throughput and latency (mean, p95) over time for the whole run
+- System resources: latency vs CPU, per-group resource charts, a per-core CPU heatmap and per-stage resource usage
 - Status code distribution pie chart
 - Percentiles table
 
@@ -988,6 +1134,8 @@ See the `samples/` directory for complete examples:
 - `multipart-upload.yaml` - File upload with multipart
 - `scenario-auth.yaml` - Multi-step authentication flow
 - `live-dashboard.yaml` - Run with the live web dashboard enabled
+- `system-monitoring.yaml` - Monitor target containers and hosts, with resource assertions
+- `monitoring/` - docker-compose stack with cAdvisor, node_exporter and Prometheus
 
 ---
 
@@ -1006,6 +1154,14 @@ flux/
 │   ├── dashboard.rs         # Opt-in live web dashboard
 │   ├── executor.rs          # Load test execution engine
 │   ├── metrics.rs           # Metrics collection
+│   ├── monitoring/          # System-resource monitoring
+│   │   ├── mod.rs           # Sampler task, report types, derived metrics, warnings
+│   │   ├── config.rs        # `monitoring` configuration
+│   │   ├── procfs.rs        # Load generator and host metrics from /proc
+│   │   ├── promql.rs        # Prometheus query_range source and presets
+│   │   ├── scrape.rs        # Direct /metrics scraping (cAdvisor, node_exporter)
+│   │   ├── series.rs        # Bounded series storage and statistics
+│   │   └── view.rs          # HTML/CSV presentation of resource data
 │   ├── prometheus.rs        # Live Prometheus endpoint
 │   ├── redact.rs            # Secret redaction for live output
 │   ├── reporter.rs          # Report generation
@@ -1065,7 +1221,7 @@ Contributions are welcome! Please ensure:
 ## 💡 Tips
 
 1. **Start small**: Begin with low concurrency and short duration
-2. **Monitor resources**: Watch CPU and memory usage
+2. **Monitor resources**: Check the "System Resources" section, and point `monitoring` at your target so a saturated target (or a saturated Flux) shows up next to the latency it caused
 3. **Use async mode**: For maximum throughput
 4. **Check reports**: HTML reports provide visual insights
 5. **Test locally first**: Validate config before production testing

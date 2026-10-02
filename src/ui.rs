@@ -1,5 +1,6 @@
 use crate::config::{Config, LoadProfile};
 use crate::metrics::{LiveMetrics, MetricsSummary};
+use crate::monitoring::{ResourceReport, SeriesSummary};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -309,6 +310,10 @@ impl TerminalUI {
             summary.mean_latency_ms
         );
 
+        if let Some(resources) = &summary.resources {
+            display_resources(resources);
+        }
+
         println!("\n{}", "═".repeat(70).bright_cyan());
         println!();
     }
@@ -326,6 +331,92 @@ impl TerminalUI {
     /// Display success message
     pub fn display_success(&self, message: &str) {
         println!("\n{} {}", "✅".bright_green(), message);
+    }
+}
+
+/// `avg / p95 / max` of a series, with its unit.
+fn stats(summary: &SeriesSummary, unit: &str) -> String {
+    format!(
+        "avg {:.2}{unit} | p95 {:.2}{unit} | max {:.2}{unit}",
+        summary.avg, summary.p95, summary.max
+    )
+}
+
+/// Print the resource section of the final summary.
+fn display_resources(resources: &ResourceReport) {
+    let derived = &resources.derived;
+    let line = |label: &str, value: String| {
+        println!("  {:<25} : {}", label.bright_white(), value);
+    };
+
+    println!("\n{}", "System Resources:".bright_green().bold());
+    if let Some(loadgen) = &derived.loadgen {
+        println!("  {}", "Load generator (Flux)".bright_yellow());
+        if let Some(cpu) = &loadgen.cpu_percent {
+            line("CPU (of available)", stats(cpu, "%"));
+        }
+        if let Some(memory) = &loadgen.memory_rss_mib {
+            line("Memory RSS", stats(memory, " MiB"));
+        }
+    }
+    for host in &derived.hosts {
+        println!("  {}", format!("Host '{}'", host.group).bright_yellow());
+        if let Some(cpu) = &host.cpu_percent {
+            line("CPU", stats(cpu, "%"));
+        }
+        if let (Some(core), Some(avg)) = (&host.hottest_core, host.hottest_core_avg_percent) {
+            line("Hottest core", format!("cpu{core} avg {avg:.1}%"));
+        }
+        if let Some(memory) = &host.memory_used_percent {
+            line("Memory used", stats(memory, "%"));
+        }
+    }
+    for container in &derived.containers {
+        println!(
+            "  {}",
+            format!("Container '{}'", container.group).bright_yellow()
+        );
+        if let Some(cpu) = &container.cpu_cores {
+            line("CPU", stats(cpu, " cores"));
+        }
+        if let Some(cpu) = &container.cpu_percent_of_limit {
+            line("CPU (of limit)", stats(cpu, "%"));
+        }
+        if let Some(throttled) = &container.cpu_throttled_percent {
+            line("CPU throttled", stats(throttled, "%"));
+        }
+        if let Some(memory) = &container.memory_working_set_mib {
+            line("Memory working set", stats(memory, " MiB"));
+        }
+        if let Some(memory) = &container.memory_percent_of_limit {
+            line("Memory (of limit)", stats(memory, "%"));
+        }
+        if let Some(growth) = container.memory_growth_mib_per_min {
+            line("Memory trend", format!("{growth:+.2} MiB/min"));
+        }
+        if let Some(cpu_ms) = container.cpu_ms_per_request {
+            line("CPU per request", format!("{cpu_ms:.2} ms"));
+        }
+        if let Some(ooms) = container.oom_events {
+            line("OOM kills", format!("{ooms:.0}"));
+        }
+    }
+
+    for warning in &resources.warnings {
+        println!("  {} {}", "⚠".bright_yellow(), warning.bright_yellow());
+    }
+    for error in &resources.errors {
+        println!("  {} {}", "✗".bright_red(), error.bright_red());
+    }
+    if !resources.missing.is_empty() {
+        println!(
+            "  {}",
+            format!(
+                "{} metric(s) had no data (exporter does not publish them); see the report",
+                resources.missing.len()
+            )
+            .dimmed()
+        );
     }
 }
 
@@ -364,12 +455,14 @@ mod tests {
             prometheus_port: None,
             prometheus_bind: "127.0.0.1".to_string(),
             live_dashboard: None,
+            monitoring: Default::default(),
             mode: "async".to_string(),
             output: OutputConfig {
                 json: "output.json".to_string(),
                 html: "output.html".to_string(),
                 csv: None,
                 max_results: 0,
+                resources_csv: None,
             },
         }
     }
@@ -437,6 +530,9 @@ mod tests {
             csv_dropped_rows: 0,
             load_profile: None,
             stages: Vec::new(),
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
 
         // This will print to stdout, but we're just testing it doesn't panic
@@ -498,8 +594,12 @@ mod tests {
                 target_rps: Some(50.0),
                 planned_duration_secs: 10.0,
                 observed_duration_secs: 10.0,
+                started_offset_secs: 0.0,
                 metrics: stage_metrics,
             }],
+            timeline: Vec::new(),
+            timeline_bucket_secs: 0,
+            resources: None,
         };
 
         ui.display_summary(&summary);
