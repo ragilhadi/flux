@@ -1,6 +1,6 @@
 [package]
 name = "flux"
-version = "1.7.1"
+version = "1.7.2"
 edition = "2021"
 
 [dependencies]
@@ -38,7 +38,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Command-line parsing
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 
 # Statistics
 hdrhistogram = "7.5"
